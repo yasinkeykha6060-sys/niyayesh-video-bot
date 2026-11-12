@@ -456,7 +456,7 @@ def compress_audio(path: Path, max_bytes: int, duration: int, min_kbps: int = 32
     length = media_duration(path, duration)
     if length <= 0:
         return None
-    kbps = int((max_bytes * 8) / length / 1000)
+    kbps = int((max_bytes * 8 * 0.90) / length / 1000)
     if kbps < min_kbps:
         return None
     kbps = min(kbps, 192)
