@@ -17,15 +17,15 @@
     },
     "7913503227:SDKxivLpM5w": {
       "chat_id": 7913503227,
-      "claim": "",
+      "claim": "1365ae091dbd43f39220181d125a07a1",
       "duration": 0,
       "local_file": "SDKxivLpM5w.mp4",
       "message_id": 37,
       "mode": "video",
       "quality": "360",
-      "status": "ready",
+      "status": "sending",
       "title": "داستان جابجایی تسلا از زبون علی 🫠",
-      "updated": 1794498060.8198738,
+      "updated": 1794498067.7373435,
       "url": "https://youtu.be/SDKxivLpM5w?si=TfvSty7dEEUt7La4",
       "video_id": "SDKxivLpM5w"
     },
@@ -42,5 +42,5 @@
       "video_id": "X0AqMgJmbNU"
     }
   },
-  "last_update_id": 227018051
+  "last_update_id": 227018052
 }
