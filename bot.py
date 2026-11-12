@@ -22,7 +22,8 @@ import requests
 
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
-ACTIVE = {"queued", "running"}
+ACTIVE = {"queued", "running", "sending"}
+STARTED = {"queued", "running", "sending", "done"}
 STALE_SECONDS = 6 * 60 * 60
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 TOKEN_LIKE_RE = re.compile(r"\d{6,}\s*:\s*[A-Za-z0-9_-]{20,}")
@@ -539,6 +540,32 @@ def job_key(chat_id: int, video_id: str) -> str:
     return f"{chat_id}:{video_id}"
 
 
+def already_started(status: object) -> bool:
+    return status in STARTED
+
+
+def newer_job(left: object, right: object) -> dict | None:
+    if not isinstance(left, dict):
+        return right if isinstance(right, dict) else None
+    if not isinstance(right, dict):
+        return left
+    if float(left.get("updated") or 0) >= float(right.get("updated") or 0):
+        return left
+    return right
+
+
+def adopt_disk_jobs(state: dict) -> None:
+    with STATE_LOCK:
+        disk = load_state()
+    merged = merge_state(state, disk)
+    state["jobs"] = merged["jobs"]
+    state["allowed_chat_ids"] = merged["allowed_chat_ids"]
+    state["last_update_id"] = max(
+        int(state.get("last_update_id") or 0),
+        int(merged.get("last_update_id") or 0),
+    )
+
+
 def busy(state: dict, chat_id: int, ignore_key: str | None = None) -> bool:
     now = time.time()
     for key, job in (state.get("jobs") or {}).items():
@@ -560,6 +587,7 @@ def put_job(state: dict, key: str, **fields: object) -> dict:
 
 
 def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
+    adopt_disk_jobs(state)
     if busy(state, chat_id):
         send_message(
             token,
@@ -716,6 +744,9 @@ def _nudge(token: str, chat_id: int, message_id: object, line: str, url: str) ->
         edit_message(token, chat_id, message_id, progress_text(percent, line, url), preview=bool(url))
 
 
+_INFLIGHT: set[str] = set()
+
+
 def _run_local(job: dict, mode: str, quality: str, ack: str) -> None:
     try:
         import download
@@ -744,32 +775,59 @@ def begin_download(
     mode: str,
     quality: str,
     ack: str,
-) -> None:
+) -> str:
     if busy(state, chat_id, ignore_key=key):
         send_message(
             token,
             chat_id,
             "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
         )
-        return
+        return "busy"
     message_id = job.get("message_id")
     link = str(job.get("url") or "")
+    with STATE_LOCK:
+        disk = load_state()
+        current = newer_job((disk.get("jobs") or {}).get(key), (state.get("jobs") or {}).get(key))
+        status = current.get("status") if isinstance(current, dict) else ""
+        if key in _INFLIGHT or already_started(status):
+            if isinstance(current, dict):
+                state.setdefault("jobs", {})[key] = current
+            return "done" if status == "done" else "duplicate"
+        _INFLIGHT.add(key)
+        saved = put_job(
+            disk,
+            key,
+            chat_id=chat_id,
+            url=str(job.get("url") or ""),
+            video_id=str(job.get("video_id") or ""),
+            title=str(job.get("title") or ""),
+            duration=job.get("duration") or 0,
+            status="queued",
+            mode=mode,
+            quality=quality,
+            message_id=message_id or 0,
+        )
+        state.setdefault("jobs", {})[key] = dict(saved)
+        save_state(disk)
     edit_message(token, chat_id, message_id, progress_text(6, ack, link), preview=bool(link))
-    put_job(state, key, status="queued", mode=mode, quality=quality, message_id=message_id or 0)
     if _can_download_here():
-        threading.Thread(
-            target=_run_local,
-            args=(state["jobs"][key], mode, quality, ack),
-            daemon=True,
-        ).start()
-        return
+        def runner() -> None:
+            try:
+                _run_local(state["jobs"][key], mode, quality, ack)
+            finally:
+                _INFLIGHT.discard(key)
+
+        threading.Thread(target=runner, daemon=True).start()
+        return "started"
     if dispatch_download(state["jobs"][key], mode, quality):
+        _INFLIGHT.discard(key)
         threading.Thread(
             target=_nudge,
             args=(token, chat_id, message_id, ack, link),
             daemon=True,
         ).start()
-        return
+        return "started"
+    _INFLIGHT.discard(key)
     put_job(state, key, status="error")
     edit_message(
         token,
@@ -777,6 +835,7 @@ def begin_download(
         message_id,
         "این بار نشد عشقم. یک کم دیگر دوباره لینک را بفرست، من اینجام 💙",
     )
+    return "busy"
 
 
 def lower_quality(quality: str) -> str | None:
@@ -787,6 +846,16 @@ def lower_quality(quality: str) -> str | None:
     if index + 1 < len(order):
         return order[index + 1]
     return None
+
+
+def _button_reply(outcome: str, started: str) -> str:
+    if outcome == "started":
+        return started
+    if outcome == "done":
+        return "تقدیم با عشق نیایشم"
+    if outcome == "duplicate":
+        return "همین یکی را دارم می‌فرستم"
+    return ""
 
 
 def handle_callback(token: str, state: dict, callback: dict) -> None:
@@ -818,8 +887,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
     if isinstance(message.get("message_id"), int):
         job["message_id"] = message["message_id"]
     if kind == "v" and choice in {"360", "720", "1080", "best"}:
-        answer_callback(token, callback_id, "چشم نیایش جانم")
-        begin_download(
+        outcome = begin_download(
             token,
             state,
             chat_id,
@@ -829,10 +897,10 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             choice,
             "چشم نیایش جانم، دارم برات می‌گیرمش 💙 چند دقیقه صبر کن",
         )
+        answer_callback(token, callback_id, _button_reply(outcome, "چشم نیایش جانم"))
         return
     if kind == "a" and choice == "mp3":
-        answer_callback(token, callback_id, "چشم عشقم")
-        begin_download(
+        outcome = begin_download(
             token,
             state,
             chat_id,
@@ -842,11 +910,11 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             "audio",
             "چشم عشقم، دارم صداش را برات جدا می‌کنم 💙 چند دقیقه صبر کن",
         )
+        answer_callback(token, callback_id, _button_reply(outcome, "چشم عشقم"))
         return
     if kind == "q" and choice == "low":
-        answer_callback(token, callback_id, "کیفیت را پایین‌تر می‌آورم")
         shrink_mode = "shrink-audio" if job.get("mode") == "audio" else "shrink"
-        begin_download(
+        outcome = begin_download(
             token,
             state,
             chat_id,
@@ -856,10 +924,10 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             "audio" if shrink_mode == "shrink-audio" else str(job.get("quality") or "best"),
             "چشم قربونت برم، کیفیت را پایین می‌آورم تا بتواند برایت بیاید 💙",
         )
+        answer_callback(token, callback_id, _button_reply(outcome, "کیفیت را پایین‌تر می‌آورم"))
         return
     if kind == "q" and choice == "link":
-        answer_callback(token, callback_id, "لینک را آماده می‌کنم")
-        begin_download(
+        outcome = begin_download(
             token,
             state,
             chat_id,
@@ -869,6 +937,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             str(job.get("quality") or "best"),
             "چشم عزیزدلم، دارم لینک دانلود را برات آماده می‌کنم 💙",
         )
+        answer_callback(token, callback_id, _button_reply(outcome, "لینک را آماده می‌کنم"))
         return
     answer_callback(token, callback_id, "این دکمه دیگر تازه نیست")
 
@@ -1036,6 +1105,14 @@ def self_check() -> None:
     assert progress_text(0, "چشم", "https://youtu.be/X0AqMgJmbNU").endswith("https://youtu.be/X0AqMgJmbNU")
     assert lower_quality("best") == "1080"
     assert lower_quality("360") is None
+    assert already_started("queued")
+    assert already_started("running")
+    assert already_started("sending")
+    assert already_started("done")
+    assert not already_started("choosing")
+    assert not already_started("error")
+    assert newer_job({"updated": 10, "status": "done"}, {"updated": 9, "status": "queued"})["status"] == "done"
+    assert newer_job({"updated": 9, "status": "done"}, {"updated": 11, "status": "choosing"})["status"] == "choosing"
     print("check ok")
 
 

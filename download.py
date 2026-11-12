@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -87,10 +88,17 @@ class Bar:
         self.last_pct = -1.0
         self.stage = 1
         self._real = False
+        self._closed = False
         self._floor = 8.0
         threading.Thread(target=self._creep, daemon=True).start()
 
+    def close(self) -> None:
+        self._real = True
+        self._closed = True
+
     def _show(self, percent: float, line: str) -> None:
+        if self._closed:
+            return
         bot.edit_message(
             self.token,
             self.chat_id,
@@ -489,7 +497,7 @@ def compress_to_fit(path: Path, duration: int) -> Path | None:
 def send_media(token: str, chat_id: int, path: Path, kind: str, title: str) -> None:
     method = "sendAudio" if kind == "audio" else "sendVideo"
     field = "audio" if kind == "audio" else "video"
-    caption = f"نیایش جانم 💙\n{title}"[:1000]
+    caption = f"تقدیم با عشق نیایشم 💙\n{title}"[:1000]
     data = {"chat_id": str(chat_id), "caption": caption}
     if kind == "audio":
         data["title"] = title[:64]
@@ -572,6 +580,26 @@ def mark(key: str, **fields: object) -> None:
     bot.publish_state()
 
 
+def claim_send(key: str) -> bool:
+    claim = uuid.uuid4().hex
+    with bot.STATE_LOCK:
+        state = bot.load_state()
+        job = (state.get("jobs") or {}).get(key)
+        if isinstance(job, dict) and job.get("status") in {"sending", "done"}:
+            print("skip duplicate send")
+            return False
+        bot.put_job(state, key, status="sending", claim=claim)
+        bot.save_state(state)
+    bot.publish_state()
+    with bot.STATE_LOCK:
+        state = bot.load_state()
+        job = (state.get("jobs") or {}).get(key)
+        if not isinstance(job, dict) or job.get("claim") != claim or job.get("status") == "done":
+            print("another send already owns this video")
+            return False
+    return True
+
+
 def send_or_offer(
     token: str,
     chat_id: int,
@@ -585,15 +613,25 @@ def send_or_offer(
 ) -> None:
     size = path.stat().st_size
     if size <= TELEGRAM_LIMIT:
+        if not claim_send(key):
+            if _reporter is not None:
+                _reporter.close()
+            return
+        if _reporter is not None:
+            _reporter.close()
         bot.edit_message(
             token,
             chat_id,
             message_id,
             bot.progress_text(100, "گرفتمش عزیزدلم، دارم می‌فرستمش برات 💙"),
         )
-        send_media(token, chat_id, path, kind, title)
-        bot.edit_message(token, chat_id, message_id, bot.progress_text(100, "رسید نیایش جانم 💙"))
-        mark(key, status="done", quality=quality)
+        try:
+            send_media(token, chat_id, path, kind, title)
+        except Exception:
+            mark(key, status="error", claim="")
+            raise
+        bot.edit_message(token, chat_id, message_id, "تقدیم با عشق نیایشم 💙")
+        mark(key, status="done", quality=quality, claim="")
         return
     if size <= RELEASE_LIMIT:
         mark(key, status="too_big", quality=quality)
