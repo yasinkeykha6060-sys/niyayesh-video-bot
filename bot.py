@@ -506,7 +506,7 @@ def friendly_probe_error(kind: str) -> str:
         return "این ویدیو محدودیت سنی دارد عزیزدلم. اگر کوکی یوتیوب را بگذاری، شاید دفعهٔ بعد بشود"
     if kind == "unavailable":
         return "این ویدیو پاک شده یا دیگر در دسترس نیست، نیایش جانم"
-    return "این بار نشد عشقم. لینک را یک کم بعد دوباره بفرست، من اینجام 💙"
+    return "این بار نشد عشقم. لینک را یک کم بعد دوباره بفرست، من اینجام ❤️"
 
 
 def choice_keyboard(video_id: str) -> dict:
@@ -578,6 +578,23 @@ def busy(state: dict, chat_id: int, ignore_key: str | None = None) -> bool:
     return False
 
 
+def release_abandoned_jobs() -> None:
+    changed = False
+    with STATE_LOCK:
+        state = load_state()
+        now = time.time()
+        for job in (state.get("jobs") or {}).values():
+            if isinstance(job, dict) and job.get("status") in ACTIVE:
+                job["status"] = "error"
+                job["claim"] = ""
+                job["updated"] = now
+                changed = True
+        if changed:
+            save_state(state)
+    if changed:
+        publish_state()
+
+
 def put_job(state: dict, key: str, **fields: object) -> dict:
     job = dict((state.setdefault("jobs", {})).get(key) or {})
     job.update(fields)
@@ -592,13 +609,13 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
         send_message(
             token,
             chat_id,
-            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
+            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم ❤️",
         )
         return
     status_id = send_message(
         token,
         chat_id,
-        progress_text(6, "دارم از یوتیوب می‌پرسم نیایش جانم 💙"),
+        progress_text(6, "دارم از یوتیوب می‌پرسم نیایش جانم ❤️"),
     )
     stop = threading.Event()
 
@@ -612,7 +629,7 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
                 token,
                 chat_id,
                 status_id,
-                progress_text(percent, "دارم از یوتیوب می‌پرسم نیایش جانم 💙"),
+                progress_text(percent, "دارم از یوتیوب می‌پرسم نیایش جانم ❤️"),
             )
 
     worker = threading.Thread(target=tick, daemon=True)
@@ -640,7 +657,7 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
             send_message(token, chat_id, show)
         return
     if info.get("is_live"):
-        live = "این یکی پخش زنده است عزیزدلم. لینک ویدیوی ضبط‌شده را بفرست تا برات بگیرم 💙"
+        live = "این یکی پخش زنده است عزیزدلم. لینک ویدیوی ضبط‌شده را بفرست تا برات بگیرم ❤️"
         if status_id:
             edit_message(token, chat_id, status_id, live)
         else:
@@ -659,12 +676,12 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
     key = job_key(chat_id, video_id)
     note = ""
     if isinstance(duration, (int, float)) and duration >= 2 * 60 * 60:
-        note = "\n\nاین یکی طولانی است نیایش جانم. محدودش نمی‌کنم؛ فقط ممکن است کمی بیشتر طول بکشد 💙"
+        note = "\n\nاین یکی طولانی است نیایش جانم. محدودش نمی‌کنم؛ فقط ممکن است کمی بیشتر طول بکشد ❤️"
     duration_line = ""
     if isinstance(duration, (int, float)) and duration > 0:
         duration_line = f"\nمدت: {format_duration(duration)}"
     text = (
-        f"نیایش جانم 💙\n{title}"
+        f"نیایش جانم ❤️\n{title}"
         f"{duration_line}\n{url}\n\n"
         f"چطور برات بفرستم، عشقم؟{note}"
     )
@@ -780,7 +797,7 @@ def begin_download(
         send_message(
             token,
             chat_id,
-            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
+            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم ❤️",
         )
         return "busy"
     message_id = job.get("message_id")
@@ -833,7 +850,7 @@ def begin_download(
         token,
         chat_id,
         message_id,
-        "این بار نشد عشقم. یک کم دیگر دوباره لینک را بفرست، من اینجام 💙",
+        "این بار نشد عشقم. یک کم دیگر دوباره لینک را بفرست، من اینجام ❤️",
     )
     return "busy"
 
@@ -895,7 +912,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             key,
             "video",
             choice,
-            "چشم نیایش جانم، دارم برات می‌گیرمش 💙 چند دقیقه صبر کن",
+            "چشم نیایش جانم، دارم برات می‌گیرمش ❤️ چند دقیقه صبر کن",
         )
         answer_callback(token, callback_id, _button_reply(outcome, "چشم نیایش جانم"))
         return
@@ -908,7 +925,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             key,
             "audio",
             "audio",
-            "چشم عشقم، دارم صداش را برات جدا می‌کنم 💙 چند دقیقه صبر کن",
+            "چشم عشقم، دارم صداش را برات جدا می‌کنم ❤️ چند دقیقه صبر کن",
         )
         answer_callback(token, callback_id, _button_reply(outcome, "چشم عشقم"))
         return
@@ -922,7 +939,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             key,
             shrink_mode,
             "audio" if shrink_mode == "shrink-audio" else str(job.get("quality") or "best"),
-            "چشم قربونت برم، کیفیت را پایین می‌آورم تا بتواند برایت بیاید 💙",
+            "چشم قربونت برم، کیفیت را پایین می‌آورم تا بتواند برایت بیاید ❤️",
         )
         answer_callback(token, callback_id, _button_reply(outcome, "کیفیت را پایین‌تر می‌آورم"))
         return
@@ -935,7 +952,7 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
             key,
             "release",
             str(job.get("quality") or "best"),
-            "چشم عزیزدلم، دارم لینک دانلود را برات آماده می‌کنم 💙",
+            "چشم عزیزدلم، دارم لینک دانلود را برات آماده می‌کنم ❤️",
         )
         answer_callback(token, callback_id, _button_reply(outcome, "لینک را آماده می‌کنم"))
         return
@@ -955,7 +972,7 @@ def handle_message(token: str, state: dict, message: dict) -> None:
     text = message.get("text") if isinstance(message.get("text"), str) else ""
     stripped = text.strip()
     if not stripped:
-        send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را برام بفرست 💙")
+        send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را برام بفرست ❤️")
         return
     command = stripped.split()[0].split("@")[0].lower()
     if command in {"/start", "/help"} or stripped in {"سلام", "سلم"}:
@@ -965,13 +982,13 @@ def handle_message(token: str, state: dict, message: dict) -> None:
                 chat_id,
                 "نیایش جانم، لینک یوتیوب را بفرست.\n"
                 "بعدش دکمه‌ها را نشانت می‌دهم: ویدیو با کیفیت‌های مختلف، یا فقط صدا.\n"
-                "هر کدام را بخواهی، چشم عشقم 💙",
+                "هر کدام را بخواهی، چشم عشقم ❤️",
             )
             return
         send_message(
             token,
             chat_id,
-            "سلام نیایش جانم 💙\n"
+            "سلام نیایش جانم ❤️\n"
             "لینک یوتیوب رو برام بفرست.\n"
             "بعدش خودم می‌پرسم ویدیو باشه یا فقط صدا، و با چه کیفیتی.\n"
             "قربونت برم.",
@@ -982,9 +999,9 @@ def handle_message(token: str, state: dict, message: dict) -> None:
         offer_video(token, state, chat_id, urls[0])
         return
     if "http://" in stripped or "https://" in stripped:
-        send_message(token, chat_id, "عزیزدلم، من فقط لینک یوتیوب را می‌توانم برات بگیرم 💙")
+        send_message(token, chat_id, "عزیزدلم، من فقط لینک یوتیوب را می‌توانم برات بگیرم ❤️")
         return
-    send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را بفرست تا بپرسم چطور می‌خواهی 💙")
+    send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را بفرست تا بپرسم چطور می‌خواهی ❤️")
 
 
 def pull_updates(token: str, offset: int, timeout: int) -> list[dict]:
@@ -1131,6 +1148,7 @@ def main() -> None:
             os.environ["WATCH_DEADLINE"] = str(deadline)
         print("watching", flush=True)
         prepare_bot(token)
+        release_abandoned_jobs()
         while deadline is None or time.time() < deadline:
             try:
                 run_once(token, poll_timeout=50, prepare=False)

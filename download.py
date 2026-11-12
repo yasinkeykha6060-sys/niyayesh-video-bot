@@ -22,6 +22,7 @@ import bot
 
 ROOT = bot.ROOT
 TELEGRAM_LIMIT = 49 * 1024 * 1024
+PART_BYTES = 45 * 1024 * 1024
 RELEASE_LIMIT = 1800 * 1024 * 1024
 QUALITY_ORDER = ["best", "1080", "720", "360"]
 DISK_SAFE = 8 * 1024 * 1024 * 1024
@@ -51,9 +52,7 @@ def video_format(quality: str) -> str:
     )
 
 
-def audio_format(duration: int = 0) -> str:
-    if duration >= 3 * 60 * 60:
-        return "ba[abr<=48][protocol=https]/ba/b"
+def audio_format(_duration: int = 0) -> str:
     return "ba[ext=m4a][protocol=https]/ba[ext=m4a]/ba[protocol=https]/ba/b"
 
 
@@ -398,7 +397,7 @@ def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str, clients: str
         "--audio-format",
         "mp3",
         "--audio-quality",
-        "192K" if duration < 3 * 60 * 60 else "48K",
+        "192K",
         "-f",
         audio_format(duration),
         url,
@@ -453,12 +452,12 @@ def media_duration(path: Path, fallback: int) -> int:
         return 0
 
 
-def compress_audio(path: Path, max_bytes: int, duration: int) -> Path | None:
+def compress_audio(path: Path, max_bytes: int, duration: int, min_kbps: int = 32) -> Path | None:
     length = media_duration(path, duration)
     if length <= 0:
         return None
     kbps = int((max_bytes * 8) / length / 1000)
-    if kbps < 32:
+    if kbps < min_kbps:
         return None
     kbps = min(kbps, 192)
     dest = path.with_name(f"{path.stem}-{kbps}.mp3")
@@ -475,69 +474,171 @@ def compress_audio(path: Path, max_bytes: int, duration: int) -> Path | None:
     return dest
 
 
-def compress_to_fit(path: Path, duration: int) -> Path | None:
-    if duration <= 0:
+def compress_video_fast(path: Path, video_bits: int) -> Path | None:
+    if video_bits < 80_000:
         return None
-    bits = int((TELEGRAM_LIMIT * 8) / duration) - 96_000
-    if bits < 80_000:
-        return None
-    dest = path.with_name(f"{path.stem}-small.mp4")
+    dest = path.with_name(f"{path.stem}-fit.mp4")
     completed = subprocess.run(
         [
             "ffmpeg",
             "-y",
             "-i",
             str(path),
-            "-vf",
-            "scale=-2:360",
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
             "-b:v",
-            str(bits),
+            str(video_bits),
+            "-maxrate",
+            str(video_bits),
+            "-bufsize",
+            str(video_bits * 2),
             "-c:a",
             "aac",
             "-b:a",
-            "96k",
+            "128k",
+            "-movflags",
+            "+faststart",
             str(dest),
         ],
         check=False,
         text=True,
-        timeout=5 * 60 * 60,
+        timeout=3 * 60 * 60,
         capture_output=True,
     )
-    if completed.returncode != 0 or not dest.exists():
-        print(bot.scrub((completed.stderr or "")[-2000:]))
+    if completed.returncode != 0 or not dest.exists() or dest.stat().st_size > TELEGRAM_LIMIT:
+        print(bot.scrub((completed.stderr or "")[-1500:]))
         return None
-    if dest.stat().st_size <= TELEGRAM_LIMIT:
-        return dest
-    return None
+    return dest
 
 
-def send_media(token: str, chat_id: int, path: Path, kind: str, title: str) -> None:
+def split_media(path: Path, depth: int = 0) -> list[Path]:
+    if path.stat().st_size <= TELEGRAM_LIMIT:
+        return [path]
+    if depth >= 3:
+        length = max(media_duration(path, 0), 1)
+        if path.suffix.lower() == ".mp3":
+            fitted = compress_audio(path, PART_BYTES, length, min_kbps=32)
+            return [fitted] if fitted is not None else []
+        bits = max(80_000, int((PART_BYTES * 8) / length) - 96_000)
+        fitted = compress_video_fast(path, bits)
+        return [fitted] if fitted is not None else []
+    size = path.stat().st_size
+    length = max(media_duration(path, 0), 1)
+    seconds = max(12.0, (PART_BYTES / size) * length * 0.75)
+    dest_dir = path.parent / f"parts-{path.stem}-{depth}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    pattern = str(dest_dir / f"p%03d{path.suffix}")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(path),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        f"{seconds:.2f}",
+        "-reset_timestamps",
+        "1",
+    ]
+    if path.suffix.lower() == ".mp4":
+        command.extend(["-segment_format_options", "movflags=+faststart"])
+    command.append(pattern)
+    completed = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        timeout=60 * 60,
+        capture_output=True,
+    )
+    parts = sorted(dest_dir.glob(f"p*{path.suffix.lower()}"))
+    if completed.returncode != 0 or not parts:
+        print(bot.scrub((completed.stderr or "")[-1500:]))
+        return []
+    packed: list[Path] = []
+    for part in parts:
+        packed.extend(split_media(part, depth + 1))
+    return [part for part in packed if part.exists() and part.stat().st_size > 0]
+
+
+def pieces_for(path: Path, kind: str) -> list[Path]:
+    """Pack a finished file into Telegram messages without crushing a long video."""
+    if path.stat().st_size <= TELEGRAM_LIMIT:
+        return [path]
+    length = media_duration(path, 0)
+    if kind == "audio":
+        fitted = compress_audio(path, PART_BYTES, length, min_kbps=96)
+        if fitted is not None:
+            return [fitted]
+        return split_media(path)
+    if length > 0:
+        video_bits = int((PART_BYTES * 8) / length) - 128_000
+        if video_bits >= 700_000:
+            fitted = compress_video_fast(path, video_bits)
+            if fitted is not None:
+                return [fitted]
+    return split_media(path)
+
+
+def send_media(
+    token: str,
+    chat_id: int,
+    path: Path,
+    kind: str,
+    title: str,
+    index: int = 1,
+    total: int = 1,
+) -> None:
     method = "sendAudio" if kind == "audio" else "sendVideo"
     field = "audio" if kind == "audio" else "video"
-    caption = f"تقدیم با عشق نیایشم 💙\n{title}"[:1000]
-    data = {"chat_id": str(chat_id), "caption": caption}
+    head = "تقدیم با عشق نیایشم ❤️"
+    if total > 1:
+        count = f"{index} از {total}".translate(bot.FA_DIGITS)
+        caption = f"{head}\n{count}\n{title}"
+    else:
+        caption = f"{head}\n{title}"
+    data = {"chat_id": str(chat_id), "caption": caption[:1000]}
     if kind == "audio":
         data["title"] = title[:64]
     else:
         data["supports_streaming"] = "true"
-    with path.open("rb") as handle:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/{method}",
-            data=data,
-            files={field: handle},
-            timeout=900,
-        )
-    if response.status_code in (401, 404):
-        raise bot.FatalTokenError()
-    try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    if response.status_code >= 400 or not body.get("ok"):
-        print(f"upload failed status={response.status_code}")
-        raise bot.TelegramError(method, str(body.get("description") or "upload failed"), response.status_code)
+    body: dict = {}
+    response = None
+    for _attempt in range(5):
+        with path.open("rb") as handle:
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                data=data,
+                files={field: handle},
+                timeout=900,
+            )
+        if response.status_code in (401, 404):
+            raise bot.FatalTokenError()
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code == 429:
+            retry = 3
+            params = body.get("parameters") if isinstance(body, dict) else None
+            if isinstance(params, dict):
+                try:
+                    retry = int(params.get("retry_after") or 3)
+                except (TypeError, ValueError):
+                    retry = 3
+            time.sleep(min(retry, 30) + 1)
+            continue
+        break
+    if response is None or response.status_code >= 400 or not body.get("ok"):
+        print(f"upload failed status={getattr(response, 'status_code', 0)}")
+        raise bot.TelegramError(method, str(body.get("description") or "upload failed"), getattr(response, "status_code", 0))
 
 
 def upload_release(path: Path, video_id: str, title: str) -> str:
@@ -587,7 +688,7 @@ def impossible_message(token: str, chat_id: int, message_id: object) -> None:
         chat_id,
         message_id,
         "نیایش جانم، این یکی آن‌قدر بزرگ است که حتی با کیفیت پایین هم این‌جا جا نمی‌شود. "
-        "اگر بخش کوتاه‌تری را بفرستی، برات می‌گیرم 💙",
+        "اگر یک ویدیوی کوتاه‌تر بفرستی، برات می‌گیرم ❤️",
     )
 
 
@@ -630,34 +731,37 @@ def send_or_offer(
     key: str,
     quality: str,
 ) -> None:
-    size = path.stat().st_size
-    if size <= TELEGRAM_LIMIT:
-        if not claim_send(key):
-            if _reporter is not None:
-                _reporter.close()
+    parts = pieces_for(path, kind)
+    if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
+        if path.stat().st_size <= RELEASE_LIMIT:
+            mark(key, status="too_big", quality=quality)
+            too_big_message(token, chat_id, message_id, video_id)
             return
+        mark(key, status="error", quality=quality)
+        impossible_message(token, chat_id, message_id)
+        return
+    if not claim_send(key):
         if _reporter is not None:
             _reporter.close()
-        bot.edit_message(
-            token,
-            chat_id,
-            message_id,
-            bot.progress_text(100, "گرفتمش عزیزدلم، دارم می‌فرستمش برات 💙"),
-        )
-        try:
-            send_media(token, chat_id, path, kind, title)
-        except Exception:
-            mark(key, status="error", claim="")
-            raise
-        bot.edit_message(token, chat_id, message_id, "تقدیم با عشق نیایشم 💙")
-        mark(key, status="done", quality=quality, claim="")
         return
-    if size <= RELEASE_LIMIT:
-        mark(key, status="too_big", quality=quality)
-        too_big_message(token, chat_id, message_id, video_id)
-        return
-    mark(key, status="error", quality=quality)
-    impossible_message(token, chat_id, message_id)
+    if _reporter is not None:
+        _reporter.close()
+    if len(parts) == 1:
+        sending = "گرفتمش عزیزدلم، دارم می‌فرستمش برات ❤️"
+    else:
+        sending = "گرفتمش عزیزدلم. همه‌اش را چند پیام پشت سر هم می‌فرستم ❤️"
+    bot.edit_message(token, chat_id, message_id, bot.progress_text(100, sending))
+    try:
+        total = len(parts)
+        for index, part in enumerate(parts, start=1):
+            send_media(token, chat_id, part, kind, title, index, total)
+            if index != total:
+                time.sleep(1)
+    except Exception:
+        mark(key, status="error", claim="")
+        raise
+    bot.edit_message(token, chat_id, message_id, "تقدیم با عشق نیایشم ❤️")
+    mark(key, status="done", quality=quality, claim="")
 
 
 def download_requested(
@@ -704,35 +808,15 @@ def reset_folder(folder: Path) -> None:
 
 def shrink(url: str, folder: Path, quality: str, duration: int) -> tuple[Path | None, str]:
     current = step_down(quality) or "360"
-    while current:
-        if duration and guessed_bytes(duration, current) > DISK_SAFE:
-            nxt = step_down(current)
-            if not nxt:
-                return None, "huge"
-            current = nxt
-            continue
-        reset_folder(folder)
-        path, error = download_video(url, folder, current)
-        if error in {"bot", "private", "age", "unavailable", "forbidden"}:
-            return None, error
-        if path is None:
-            nxt = step_down(current)
-            if not nxt:
-                return None, error or "unknown"
-            current = nxt
-            continue
-        path = ensure_mp4(path)
-        if path.stat().st_size <= TELEGRAM_LIMIT:
-            return path, current
-        nxt = step_down(current)
-        if nxt and nxt != current:
-            current = nxt
-            continue
-        smaller = compress_to_fit(path, duration)
-        if smaller is not None:
-            return smaller, current
-        return path, current
-    return None, "huge"
+    if duration and guessed_bytes(duration, current) > DISK_SAFE:
+        return None, "huge"
+    reset_folder(folder)
+    path, error = download_video(url, folder, current)
+    if error in {"bot", "private", "age", "unavailable", "forbidden"}:
+        return None, error
+    if path is None:
+        return None, error or "unknown"
+    return ensure_mp4(path), current
 
 
 def release_file(
@@ -829,7 +913,7 @@ def run(
     folder = work_dir(video_id)
     mark(key, status="running", mode=mode, quality=quality, chat_id=chat_id, url=url, video_id=video_id)
     global _reporter
-    line = status_line or "چشم نیایش جانم، دارم برات می‌گیرمش 💙 چند دقیقه صبر کن"
+    line = status_line or "چشم نیایش جانم، دارم برات می‌گیرمش ❤️ چند دقیقه صبر کن"
     _reporter = Bar(token, chat_id, message_id, line, url)
     title = bot.public_title(url) or video_id
     duration = 0
@@ -839,13 +923,6 @@ def run(
             path, error = download_audio(url, folder, duration)
             if path is None:
                 finish_error(token, chat_id, message_id, key, error or "unknown")
-                return
-            if path.stat().st_size > TELEGRAM_LIMIT:
-                smaller = compress_audio(path, TELEGRAM_LIMIT, duration)
-                path = smaller or path
-            if path.stat().st_size > TELEGRAM_LIMIT:
-                mark(key, status="too_big", mode="audio", quality="audio")
-                too_big_message(token, chat_id, message_id, video_id)
                 return
             send_or_offer(token, chat_id, message_id, path, "audio", title, video_id, key, "audio")
             return
@@ -859,10 +936,6 @@ def run(
                     return
                 finish_error(token, chat_id, message_id, key, outcome or "unknown")
                 return
-            if path.stat().st_size > TELEGRAM_LIMIT:
-                mark(key, status="too_big", quality=str(outcome))
-                too_big_message(token, chat_id, message_id, video_id)
-                return
             send_or_offer(token, chat_id, message_id, path, "video", title, video_id, key, str(outcome))
             return
 
@@ -874,7 +947,7 @@ def run(
                     token,
                     chat_id,
                     message_id,
-                    "عزیزدلم، خود ویدیو آن‌قدر بزرگ است که این‌جا جا نمی‌شود. صداش را برات می‌گذارم 💙",
+                    "عزیزدلم، خود ویدیو آن‌قدر بزرگ است که این‌جا جا نمی‌شود. صداش را برات می‌گذارم ❤️",
                 )
                 path, kind, outcome = release_file(url, folder, "audio", "audio", duration)
             if path is None or outcome == "huge" or path.stat().st_size > RELEASE_LIMIT:
@@ -887,7 +960,7 @@ def run(
             note = ""
             if kind == "audio" and quality != "audio":
                 note = "خود تصویر این‌جا جا نشد، برای همین صدا را گذاشتم.\n"
-            bot.edit_message(token, chat_id, message_id, "فایل آماده است عزیزدلم، دارم لینکش را می‌گذارم 💙")
+            bot.edit_message(token, chat_id, message_id, "فایل آماده است عزیزدلم، دارم لینکش را می‌گذارم ❤️")
             link = upload_release(path, video_id, title)
             bot.send_message(
                 token,
@@ -898,7 +971,7 @@ def run(
                 "تا ۲۴ ساعت دیگر خودبه‌خود پاک می‌شود.\n"
                 f"{link}",
             )
-            bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم 💙")
+            bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")
             mark(key, status="done", quality=str(outcome), mode=kind)
             return
 

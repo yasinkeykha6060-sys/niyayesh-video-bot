@@ -146,7 +146,100 @@ def height_ok(label: str, seen: int, heights: list[int]) -> bool:
     return seen + 40 >= min(want, target)
 
 
+def _make_media(command: list[str], dest: Path) -> bool:
+    made = subprocess.run(command, check=False, text=True, timeout=180, capture_output=True)
+    if made.returncode != 0 or not dest.exists() or dest.stat().st_size <= 0:
+        print("FAIL pack build", dest.name)
+        print((made.stderr or "")[-500:])
+        return False
+    return True
+
+
+def prove_pack() -> bool:
+    folder = Path("/tmp/yt-pack")
+    if folder.exists():
+        shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    long_video = folder / "long.mp4"
+    short_video = folder / "short.mp4"
+    audio = folder / "clip.mp3"
+    old_limit = download.TELEGRAM_LIMIT
+    old_part = download.PART_BYTES
+    try:
+        download.TELEGRAM_LIMIT = 1_500_000
+        download.PART_BYTES = 1_100_000
+        if not _make_media(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30,noise=alls=80:allf=t",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "30",
+                "-c:v", "libx264", "-b:v", "2500k", "-minrate", "1800k", "-maxrate", "2500k", "-bufsize", "2500k",
+                "-c:a", "aac", "-shortest",
+                str(long_video),
+            ],
+            long_video,
+        ):
+            return False
+        if long_video.stat().st_size <= download.TELEGRAM_LIMIT:
+            print("FAIL pack split source was already small", long_video.stat().st_size)
+            return False
+        parts = download.pieces_for(long_video, "video")
+        sizes = [part.stat().st_size for part in parts]
+        print("pack split", sizes)
+        if len(parts) < 2 or any(size > download.TELEGRAM_LIMIT or size <= 0 for size in sizes):
+            print("FAIL pack split")
+            return False
+        if not _make_media(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30,noise=alls=80:allf=t",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "4",
+                "-c:v", "libx264", "-b:v", "5000k", "-minrate", "4000k", "-maxrate", "5000k", "-bufsize", "5000k",
+                "-c:a", "aac", "-shortest",
+                str(short_video),
+            ],
+            short_video,
+        ):
+            return False
+        if short_video.stat().st_size <= download.TELEGRAM_LIMIT:
+            print("FAIL pack fit source was already small", short_video.stat().st_size)
+            return False
+        fitted = download.pieces_for(short_video, "video")
+        print("pack fit", [part.stat().st_size for part in fitted])
+        if len(fitted) != 1 or fitted[0].stat().st_size > download.TELEGRAM_LIMIT:
+            print("FAIL pack fit")
+            return False
+        download.TELEGRAM_LIMIT = 400_000
+        download.PART_BYTES = 320_000
+        if not _make_media(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "20",
+                "-c:a", "libmp3lame", "-b:a", "192k",
+                str(audio),
+            ],
+            audio,
+        ):
+            return False
+        packed = download.pieces_for(audio, "audio")
+        print("pack audio", [part.stat().st_size for part in packed])
+        if len(packed) != 1 or packed[0].stat().st_size > download.TELEGRAM_LIMIT:
+            print("FAIL pack audio")
+            return False
+        print("PASS pack")
+        return True
+    finally:
+        download.TELEGRAM_LIMIT = old_limit
+        download.PART_BYTES = old_part
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def main() -> int:
+    if not prove_pack():
+        return 1
     proxy = os.environ.get("YT_PROXY", "").strip()
     print("proxy", "yes" if proxy else "no")
     if not proxy:
