@@ -1,5 +1,7 @@
 {
-  "allowed_chat_ids": [],
+  "allowed_chat_ids": [
+    7913503227
+  ],
   "jobs": {},
-  "last_update_id": 0
+  "last_update_id": 227018025
 }
