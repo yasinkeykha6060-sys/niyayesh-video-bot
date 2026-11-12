@@ -569,6 +569,101 @@ def split_media(path: Path, depth: int = 0) -> list[Path]:
     return [part for part in packed if part.exists() and part.stat().st_size > 0]
 
 
+def media_height(path: Path) -> int:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=height",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ],
+        check=False,
+        text=True,
+        timeout=60,
+        capture_output=True,
+    )
+    try:
+        return int(float((completed.stdout or "").strip()))
+    except ValueError:
+        return 0
+
+
+def _encode_video(path: Path, height: int, video_bits: int, audio_k: int) -> Path | None:
+    dest = path.with_name(f"{path.stem}-h{height}-{video_bits}.mp4")
+    command = ["ffmpeg", "-y", "-i", str(path)]
+    source_h = media_height(path)
+    if source_h <= 0 or height < source_h:
+        command.extend(["-vf", f"scale=-2:{height}"])
+    command.extend(
+        [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        str(video_bits),
+        "-maxrate",
+        str(video_bits),
+        "-bufsize",
+        str(video_bits * 2),
+        "-c:a",
+        "aac",
+        "-b:a",
+        f"{audio_k}k",
+        "-movflags",
+        "+faststart",
+        str(dest),
+        ]
+    )
+    completed = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        timeout=3 * 60 * 60,
+        capture_output=True,
+    )
+    if completed.returncode != 0 or not dest.exists() or dest.stat().st_size <= 0:
+        print(bot.scrub((completed.stderr or "")[-800:]))
+        return None
+    return dest
+
+
+def compress_until_fit(path: Path, kind: str) -> Path | None:
+    """Shrink until one Telegram message can carry the file."""
+    if path.stat().st_size <= TELEGRAM_LIMIT:
+        return path
+    length = max(media_duration(path, 0), 1)
+    if kind == "audio":
+        for kbps in (160, 128, 96, 64, 48, 32, 24):
+            dest = path.with_name(f"{path.stem}-fit{kbps}.mp3")
+            completed = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k", str(dest)],
+                check=False,
+                text=True,
+                timeout=3 * 60 * 60,
+                capture_output=True,
+            )
+            if completed.returncode == 0 and dest.exists() and dest.stat().st_size <= TELEGRAM_LIMIT:
+                return dest
+        return None
+    audio_k = 64 if length < 3600 else 32
+    budget = max(30_000, int((PART_BYTES * 8) / length) - audio_k * 1000)
+    for height in (1080, 720, 480, 360, 240, 144):
+        fitted = _encode_video(path, height, budget, audio_k)
+        if fitted is not None and fitted.stat().st_size <= TELEGRAM_LIMIT:
+            return fitted
+        budget = max(30_000, int(budget * 0.62))
+    return None
+
+
 def pieces_for(path: Path, kind: str) -> list[Path]:
     """Pack a finished file into Telegram messages without crushing a long video."""
     if path.stat().st_size <= TELEGRAM_LIMIT:
@@ -721,7 +816,7 @@ def claim_send(key: str) -> bool:
     return True
 
 
-def send_or_offer(
+def offer_choice(
     token: str,
     chat_id: int,
     message_id: object,
@@ -732,37 +827,146 @@ def send_or_offer(
     key: str,
     quality: str,
 ) -> None:
-    parts = pieces_for(path, kind)
-    if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
-        if path.stat().st_size <= RELEASE_LIMIT:
-            mark(key, status="too_big", quality=quality)
-            too_big_message(token, chat_id, message_id, video_id)
-            return
-        mark(key, status="error", quality=quality)
-        impossible_message(token, chat_id, message_id)
-        return
-    if not claim_send(key):
-        if _reporter is not None:
-            _reporter.close()
-        return
     if _reporter is not None:
         _reporter.close()
-    if len(parts) == 1:
-        sending = "گرفتمش عزیزدلم، دارم می‌فرستمش برات ❤️"
-    else:
-        sending = "گرفتمش عزیزدلم. همه‌اش را چند پیام پشت سر هم می‌فرستم ❤️"
-    bot.edit_message(token, chat_id, message_id, bot.progress_text(100, sending))
-    try:
-        total = len(parts)
-        for index, part in enumerate(parts, start=1):
-            send_media(token, chat_id, part, kind, title, index, total)
-            if index != total:
-                time.sleep(1)
-    except Exception:
-        mark(key, status="error", claim="")
-        raise
+    mark(key, status="ready", quality=quality, mode=kind, local_file=path.name)
+    word = "صدا" if kind == "audio" else "ویدیو"
+    bot.edit_message(
+        token,
+        chat_id,
+        message_id,
+        f"گرفتمش نیایش جانم ❤️\n{title}\nخود {word} را همین‌جا بفرستم، یا لینک؟",
+        bot.delivery_keyboard(video_id, kind),
+    )
+
+
+def saved_file(video_id: str, name: str = "") -> Path | None:
+    folder = ROOT / "downloads" / video_id
+    if name:
+        candidate = folder / Path(name).name
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    if not folder.exists():
+        return None
+    return newest_media(folder)
+
+
+def send_fitted(
+    token: str,
+    chat_id: int,
+    message_id: object,
+    path: Path,
+    kind: str,
+    title: str,
+    key: str,
+    quality: str,
+) -> bool:
+    if not claim_send(key):
+        return False
+    bot.edit_message(token, chat_id, message_id, "دارم آماده‌اش می‌کنم که همین‌جا پخش شود ❤️")
+    fitted = compress_until_fit(path, kind)
+    parts = [fitted] if fitted is not None else []
+    if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
+        parts = pieces_for(path, kind)
+    if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
+        mark(key, status="error", quality=quality, claim="")
+        impossible_message(token, chat_id, message_id)
+        return True
+    total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        send_media(token, chat_id, part, kind, title, index, total)
+        if index != total:
+            time.sleep(1)
     bot.edit_message(token, chat_id, message_id, "تقدیم با عشق نیایشم ❤️")
     mark(key, status="done", quality=quality, claim="")
+    return True
+
+
+def send_link(
+    token: str,
+    chat_id: int,
+    message_id: object,
+    path: Path,
+    title: str,
+    video_id: str,
+    key: str,
+    quality: str,
+    kind: str,
+) -> bool:
+    if path.stat().st_size > RELEASE_LIMIT:
+        mark(key, status="ready", quality=quality)
+        bot.edit_message(
+            token,
+            chat_id,
+            message_id,
+            "عزیزدلم، فایل اصلی برای لینک خیلی بزرگ است. خود ویدیو را بزن تا برایت بفرستمش ❤️",
+            bot.delivery_keyboard(video_id, kind),
+        )
+        return False
+    if not claim_send(key):
+        return False
+    bot.edit_message(token, chat_id, message_id, "فایل آماده است عزیزدلم، دارم لینکش را می‌گذارم ❤️")
+    link = upload_release(path, video_id, title)
+    bot.send_message(
+        token,
+        chat_id,
+        "قربونت برم، لینک دانلود را گذاشتم.\n"
+        "تا ۲۴ ساعت می‌ماند و بعد پاک می‌شود.\n"
+        "اگر این نشانی را برای کسی بفرستی، او هم می‌تواند بازش کند.\n"
+        f"{link}",
+    )
+    bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")
+    mark(key, status="done", quality=quality, claim="")
+    return True
+
+
+def deliver_choice(
+    chat_id: int,
+    url: str,
+    mode: str,
+    quality: str,
+    video_id: str,
+    message_id: int,
+    choice: str,
+    local_name: str = "",
+) -> None:
+    token = bot.load_token()
+    if not token or not video_id:
+        return
+    path = saved_file(video_id, local_name)
+    if path is None:
+        run(
+            chat_id=chat_id,
+            url=url,
+            mode="release" if choice == "link" else "deliver-file",
+            quality=quality or ("audio" if mode == "audio" else "best"),
+            video_id=video_id,
+            message_id=message_id,
+            status_line="چشم نیایش جانم، دارم برات می‌گیرمش ❤️",
+        )
+        return
+    key = bot.job_key(chat_id, video_id)
+    kind = "audio" if mode == "audio" or quality == "audio" else "video"
+    title = bot.public_title(url) or video_id
+    owned = False
+    try:
+        if choice == "link":
+            owned = send_link(token, chat_id, message_id, path, title, video_id, key, quality, kind)
+        else:
+            owned = send_fitted(token, chat_id, message_id, path, kind, title, key, quality)
+    except bot.FatalTokenError:
+        print("BOT_TOKEN was rejected by Telegram.", file=sys.stderr)
+    except Exception as exc:
+        print(bot.scrub(f"{exc.__class__.__name__}: {exc}"), file=sys.stderr)
+        try:
+            mark(key, status="error", claim="")
+            bot.edit_message(token, chat_id, message_id, bot.friendly_probe_error("unknown"))
+        except Exception as nested:
+            print(bot.scrub(nested.__class__.__name__), file=sys.stderr)
+        owned = True
+    finally:
+        if owned:
+            shutil.rmtree(ROOT / "downloads" / video_id, ignore_errors=True)
 
 
 def download_requested(
@@ -918,14 +1122,30 @@ def run(
     _reporter = Bar(token, chat_id, message_id, line, url)
     title = bot.public_title(url) or video_id
     duration = 0
+    keep = False
     try:
+        if mode == "deliver-file":
+            path, kind, error = download_requested(
+                url,
+                folder,
+                "audio" if quality == "audio" or mode == "audio" else "video",
+                quality,
+                duration,
+            )
+            if path is None:
+                finish_error(token, chat_id, message_id, key, error or "unknown")
+                return
+            send_fitted(token, chat_id, message_id, path, kind, title, key, quality)
+            return
+
         if mode == "shrink-audio":
             reset_folder(folder)
             path, error = download_audio(url, folder, duration)
             if path is None:
                 finish_error(token, chat_id, message_id, key, error or "unknown")
                 return
-            send_or_offer(token, chat_id, message_id, path, "audio", title, video_id, key, "audio")
+            offer_choice(token, chat_id, message_id, path, "audio", title, video_id, key, "audio")
+            keep = True
             return
 
         if mode == "shrink":
@@ -937,7 +1157,8 @@ def run(
                     return
                 finish_error(token, chat_id, message_id, key, outcome or "unknown")
                 return
-            send_or_offer(token, chat_id, message_id, path, "video", title, video_id, key, str(outcome))
+            offer_choice(token, chat_id, message_id, path, "video", title, video_id, key, str(outcome))
+            keep = True
             return
 
         if mode == "release":
@@ -984,7 +1205,8 @@ def run(
         if path is None:
             finish_error(token, chat_id, message_id, key, error or "unknown")
             return
-        send_or_offer(token, chat_id, message_id, path, kind, title, video_id, key, quality)
+        offer_choice(token, chat_id, message_id, path, kind, title, video_id, key, quality)
+        keep = True
     except bot.FatalTokenError:
         print("BOT_TOKEN was rejected by Telegram.", file=sys.stderr)
         sys.exit(1)
@@ -996,7 +1218,8 @@ def run(
         except Exception as nested:
             print(bot.scrub(nested.__class__.__name__), file=sys.stderr)
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        if not keep:
+            shutil.rmtree(folder, ignore_errors=True)
         bot.clear_cookies()
         _reporter = None
 

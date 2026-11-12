@@ -525,12 +525,13 @@ def choice_keyboard(video_id: str) -> dict:
     }
 
 
-def delivery_keyboard(video_id: str) -> dict:
+def delivery_keyboard(video_id: str, kind: str = "video") -> dict:
+    label = "🎵 خود صدا" if kind == "audio" else "🎬 خود ویدیو"
     return {
         "inline_keyboard": [
             [
-                {"text": "📉 کیفیت پایین‌تر", "callback_data": f"q:low:{video_id}"},
-                {"text": "🔗 لینک دانلود", "callback_data": f"q:link:{video_id}"},
+                {"text": label, "callback_data": f"q:file:{video_id}"},
+                {"text": "🔗 لینک", "callback_data": f"q:link:{video_id}"},
             ]
         ]
     }
@@ -875,6 +876,21 @@ def _button_reply(outcome: str, started: str) -> str:
     return ""
 
 
+def _deliver_saved(job: dict, choice: str) -> None:
+    import download
+
+    download.deliver_choice(
+        chat_id=int(job["chat_id"]),
+        url=str(job.get("url") or ""),
+        mode=str(job.get("mode") or "video"),
+        quality=str(job.get("quality") or "best"),
+        video_id=str(job.get("video_id") or ""),
+        message_id=int(job.get("message_id") or 0),
+        choice=choice,
+        local_name=str(job.get("local_file") or ""),
+    )
+
+
 def handle_callback(token: str, state: dict, callback: dict) -> None:
     callback_id = str(callback.get("id") or "")
     message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
@@ -929,32 +945,20 @@ def handle_callback(token: str, state: dict, callback: dict) -> None:
         )
         answer_callback(token, callback_id, _button_reply(outcome, "چشم عشقم"))
         return
-    if kind == "q" and choice == "low":
-        shrink_mode = "shrink-audio" if job.get("mode") == "audio" else "shrink"
-        outcome = begin_download(
-            token,
-            state,
-            chat_id,
-            job,
-            key,
-            shrink_mode,
-            "audio" if shrink_mode == "shrink-audio" else str(job.get("quality") or "best"),
-            "چشم قربونت برم، کیفیت را پایین می‌آورم تا بتواند برایت بیاید ❤️",
-        )
-        answer_callback(token, callback_id, _button_reply(outcome, "کیفیت را پایین‌تر می‌آورم"))
-        return
-    if kind == "q" and choice == "link":
-        outcome = begin_download(
-            token,
-            state,
-            chat_id,
-            job,
-            key,
-            "release",
-            str(job.get("quality") or "best"),
-            "چشم عزیزدلم، دارم لینک دانلود را برات آماده می‌کنم ❤️",
-        )
-        answer_callback(token, callback_id, _button_reply(outcome, "لینک را آماده می‌کنم"))
+    if kind == "q" and choice in {"file", "link", "low"}:
+        if job.get("status") == "done":
+            answer_callback(token, callback_id, "تقدیم با عشق نیایشم")
+            return
+        if job.get("status") == "sending":
+            answer_callback(token, callback_id, "دارم می‌فرستم")
+            return
+        picked = "link" if choice == "link" else "file"
+        answer_callback(token, callback_id, "چشم نیایش جانم" if picked == "file" else "لینک را آماده می‌کنم")
+        threading.Thread(
+            target=_deliver_saved,
+            args=(dict(job), picked),
+            daemon=True,
+        ).start()
         return
     answer_callback(token, callback_id, "این دکمه دیگر تازه نیست")
 
