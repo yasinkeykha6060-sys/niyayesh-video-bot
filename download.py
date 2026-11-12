@@ -189,6 +189,8 @@ def base_command(url: str, folder: Path, proxy: str = "", clients: str = "") -> 
 def _routes() -> list[str]:
     proxy = os.environ.get("YT_PROXY", "").strip()
     if proxy:
+        os.environ["ALL_PROXY"] = proxy
+        os.environ["all_proxy"] = proxy
         return [proxy]
     return [""]
 
