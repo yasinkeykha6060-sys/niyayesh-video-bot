@@ -226,24 +226,6 @@ def _ffmpeg_progress(
     return code
 
 
-def _fit_height(bits: int, source_h: int) -> int:
-    if bits >= 1_800_000:
-        height = 1080
-    elif bits >= 800_000:
-        height = 720
-    elif bits >= 350_000:
-        height = 480
-    elif bits >= 160_000:
-        height = 360
-    elif bits >= 70_000:
-        height = 240
-    else:
-        height = 144
-    if source_h > 0:
-        height = min(height, source_h)
-    return max(144, height)
-
-
 def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
     print("yt-dlp start", flush=True)
     proc = subprocess.Popen(
@@ -561,7 +543,7 @@ def compress_audio(path: Path, max_bytes: int, duration: int, min_kbps: int = 32
 
 
 def compress_video_fast(path: Path, video_bits: int) -> Path | None:
-    if video_bits < 80_000:
+    if video_bits < 450_000:
         return None
     dest = path.with_name(f"{path.stem}-fit.mp4")
     completed = subprocess.run(
@@ -609,7 +591,7 @@ def split_media(path: Path, depth: int = 0) -> list[Path]:
         if path.suffix.lower() == ".mp3":
             fitted = compress_audio(path, PART_BYTES, length, min_kbps=32)
             return [fitted] if fitted is not None else []
-        bits = max(80_000, int((PART_BYTES * 8) / length) - 96_000)
+        bits = max(450_000, int((PART_BYTES * 8) / length) - 96_000)
         fitted = compress_video_fast(path, bits)
         return [fitted] if fitted is not None else []
     size = path.stat().st_size
@@ -654,122 +636,70 @@ def split_media(path: Path, depth: int = 0) -> list[Path]:
     return [part for part in packed if part.exists() and part.stat().st_size > 0]
 
 
-def media_height(path: Path) -> int:
-    completed = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=height",
-            "-of",
-            "default=nw=1:nk=1",
-            str(path),
-        ],
-        check=False,
-        text=True,
-        timeout=60,
-        capture_output=True,
-    )
-    try:
-        return int(float((completed.stdout or "").strip()))
-    except ValueError:
-        return 0
-
-
-def _encode_video(
-    path: Path,
-    height: int,
-    video_bits: int,
-    audio_k: int,
-    length: int,
-    pulse: Pulse | None,
-) -> Path | None:
-    dest = path.with_name(f"{path.stem}-h{height}-{video_bits}.mp4")
-    command = ["ffmpeg", "-y", "-i", str(path)]
-    source_h = media_height(path)
-    if source_h <= 0 or height < source_h:
-        command.extend(["-vf", f"scale=-2:{height}"])
-    command.extend(
-        [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-b:v",
-            str(video_bits),
-            "-maxrate",
-            str(video_bits),
-            "-bufsize",
-            str(video_bits * 2),
-            "-c:a",
-            "aac",
-            "-b:a",
-            f"{audio_k}k",
-            "-movflags",
-            "+faststart",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(dest),
-        ]
-    )
-    code = _ffmpeg_progress(command, length, pulse, 8, 86)
-    if code != 0 or not dest.exists() or dest.stat().st_size <= 0:
-        return None
-    return dest
-
-
 def compress_until_fit(path: Path, kind: str, pulse: Pulse | None = None) -> Path | None:
-    """One fast pass that lands inside a single Telegram message."""
+    """Shrink the audio first. The picture stays as it was."""
     if path.stat().st_size <= TELEGRAM_LIMIT:
         return path
     length = max(media_duration(path, 0), 1)
     if kind == "audio":
         kbps = int((PART_BYTES * 8 * 0.9) / length / 1000)
-        kbps = min(160, max(24, kbps))
-        for _try in range(2):
-            dest = path.with_name(f"{path.stem}-fit{kbps}.mp3")
-            code = _ffmpeg_progress(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(path),
-                    "-vn",
-                    "-c:a",
-                    "libmp3lame",
-                    "-b:a",
-                    f"{kbps}k",
-                    "-progress",
-                    "pipe:1",
-                    "-nostats",
-                    str(dest),
-                ],
-                length,
-                pulse,
-                8,
-                86,
-            )
-            if code == 0 and dest.exists() and dest.stat().st_size <= TELEGRAM_LIMIT:
-                return dest
-            kbps = max(24, int(kbps * 0.7))
+        kbps = min(160, max(48, kbps))
+        dest = path.with_name(f"{path.stem}-fit{kbps}.mp3")
+        code = _ffmpeg_progress(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                f"{kbps}k",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(dest),
+            ],
+            length,
+            pulse,
+            8,
+            86,
+        )
+        if code == 0 and dest.exists() and dest.stat().st_size <= TELEGRAM_LIMIT:
+            return dest
         return None
-    audio_k = 48 if length >= 20 * 60 else 64
-    budget = max(40_000, int((PART_BYTES * 8 * 0.9) / length) - audio_k * 1000)
-    source_h = media_height(path)
-    fitted: Path | None = None
-    for _try in range(2):
-        height = _fit_height(budget, source_h)
-        fitted = _encode_video(path, height, budget, audio_k, length, pulse)
-        if fitted is not None and fitted.stat().st_size <= TELEGRAM_LIMIT:
-            return fitted
-        budget = max(40_000, int(budget * 0.65))
-    return fitted if fitted is not None and fitted.stat().st_size <= TELEGRAM_LIMIT else None
+    for audio_k, channels in ((64, 2), (32, 1)):
+        dest = path.with_name(f"{path.stem}-a{audio_k}.mp4")
+        code = _ffmpeg_progress(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{audio_k}k",
+                "-ac",
+                str(channels),
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(dest),
+            ],
+            length,
+            pulse,
+            8,
+            86,
+        )
+        if code == 0 and dest.exists() and 0 < dest.stat().st_size <= TELEGRAM_LIMIT:
+            return dest
+    return None
 
 
 def pieces_for(path: Path, kind: str) -> list[Path]:

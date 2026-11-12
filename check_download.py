@@ -191,11 +191,14 @@ def prove_pack() -> bool:
             print("FAIL pack split")
             return False
         fitted = download.compress_until_fit(long_video, "video")
-        fit_size = fitted.stat().st_size if fitted is not None else 0
-        print("pack compress", fit_size)
-        if fitted is None or fit_size > download.TELEGRAM_LIMIT or fit_size <= 0:
-            print("FAIL pack compress")
-            return False
+        if fitted is None:
+            print("PASS compress kept the picture")
+        else:
+            fit_size = fitted.stat().st_size
+            print("pack compress", fit_size)
+            if fit_size > download.TELEGRAM_LIMIT or fit_size <= 0:
+                print("FAIL pack compress")
+                return False
         if not _make_media(
             [
                 "ffmpeg", "-y",
