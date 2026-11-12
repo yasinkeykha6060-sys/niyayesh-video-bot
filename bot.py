@@ -105,13 +105,12 @@ def env_allowed() -> set[int]:
 
 
 def chat_allowed(state: dict, chat_id: int) -> bool:
+    # An empty allow-list used to keep only the first private chat. That chat
+    # was the phone used for testing, so Niayesh's messages were dropped.
     allowed = env_allowed()
     if allowed:
         return chat_id in allowed
-    saved = [int(item) for item in state.get("allowed_chat_ids") or [] if str(item).lstrip("-").isdigit()]
-    if not saved:
-        return True
-    return chat_id in saved
+    return True
 
 
 def remember_chat(state: dict, chat_id: int) -> None:
@@ -1120,6 +1119,12 @@ def self_check() -> None:
     assert merged["last_update_id"] == 5
     assert merged["jobs"]["a"]["status"] == "running"
     assert merged["allowed_chat_ids"] == [1, 2]
+    previous_allowed = os.environ.pop("ALLOWED_CHAT_IDS", None)
+    try:
+        assert chat_allowed({"allowed_chat_ids": [1]}, 2)
+    finally:
+        if previous_allowed is not None:
+            os.environ["ALLOWED_CHAT_IDS"] = previous_allowed
     assert stable_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
     assert filling_bar(0) == "▱" * 12
     assert filling_bar(100) == "▰" * 12
