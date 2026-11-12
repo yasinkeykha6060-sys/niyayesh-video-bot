@@ -62,6 +62,31 @@ jobs:
       - name: Start YouTube token helper
         run: docker run -d --name bgutil --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider || echo "pot server unavailable"
 
+      - name: Open a clean network path
+        run: |
+          set +e
+          sudo apt-get update
+          sudo apt-get install -y gnupg curl
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com noble main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          if ! apt-cache show cloudflare-warp >/dev/null 2>&1; then
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+            sudo apt-get update
+          fi
+          sudo apt-get install -y cloudflare-warp
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode proxy
+          sudo warp-cli --accept-tos proxy port 40000
+          sudo warp-cli --accept-tos connect
+          sleep 4
+          if curl -fsS --max-time 25 --proxy socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace; then
+            echo "YT_PROXY=socks5://127.0.0.1:40000" >> "$GITHUB_ENV"
+            echo "clean network ready"
+          else
+            echo "clean network unavailable"
+          fi
+
       - name: Download and send
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}

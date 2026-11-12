@@ -142,8 +142,8 @@ def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(command, code, detail, detail)
 
 
-def base_command(url: str, folder: Path) -> list[str]:
-    return [
+def base_command(url: str, folder: Path, proxy: str = "") -> list[str]:
+    command = [
         *bot.ytdlp_base(url),
         "--newline",
         "--progress",
@@ -152,11 +152,118 @@ def base_command(url: str, folder: Path) -> list[str]:
         "-o",
         str(folder / "%(id)s.%(ext)s"),
     ]
+    if proxy:
+        command.extend(["--proxy", proxy])
+    return command
+
+
+def save_stream(file_url: str, dest: Path) -> Path | None:
+    try:
+        response = requests.get(
+            file_url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
+            stream=True,
+            timeout=180,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(bot.scrub(exc.__class__.__name__))
+        return None
+    total = 0
+    for header in ("content-length", "estimated-content-length"):
+        raw = response.headers.get(header) or ""
+        if raw.isdigit() and int(raw) > 0:
+            total = int(raw)
+            break
+    got = 0
+    last = 0.0
+    try:
+        with dest.open("wb") as handle:
+            for chunk in response.iter_content(256 * 1024):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                got += len(chunk)
+                now = time.time()
+                if _reporter is not None and total > 0 and now - last >= 4:
+                    last = now
+                    _reporter(min(99, got * 100 / total))
+    except requests.RequestException as exc:
+        print(bot.scrub(exc.__class__.__name__))
+        dest.unlink(missing_ok=True)
+        return None
+    finally:
+        response.close()
+    if not dest.exists() or dest.stat().st_size < 1024:
+        dest.unlink(missing_ok=True)
+        return None
+    return dest
+
+
+def cobalt_download(url: str, folder: Path, video_id: str, mode: str, quality: str) -> Path | None:
+    hosts = ("https://rue-cobalt.xenon.zone", "https://cobaltapi.cjs.nz")
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Content-Type": "application/json"}
+    chosen = {"best": "max", "1080": "1080", "720": "720", "360": "360"}.get(quality, "720")
+    for host in hosts:
+        if mode == "audio":
+            body = {
+                "url": url,
+                "downloadMode": "audio",
+                "audioFormat": "mp3",
+                "audioBitrate": "192",
+                "alwaysProxy": True,
+                "filenameStyle": "basic",
+            }
+            ext = ".mp3"
+        else:
+            body = {
+                "url": url,
+                "downloadMode": "auto",
+                "videoQuality": chosen,
+                "youtubeVideoCodec": "h264",
+                "youtubeVideoContainer": "mp4",
+                "alwaysProxy": True,
+                "filenameStyle": "basic",
+            }
+            ext = ".mp4"
+        try:
+            response = requests.post(host + "/", headers=headers, json=body, timeout=70)
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            print("backup failed", exc.__class__.__name__)
+            continue
+        if payload.get("status") not in {"tunnel", "redirect"} or not payload.get("url"):
+            code = ""
+            if isinstance(payload.get("error"), dict):
+                code = str(payload["error"].get("code") or "")
+            print("backup status", payload.get("status"), code)
+            continue
+        print("backup accepted", host)
+        saved = save_stream(str(payload["url"]), folder / f"{video_id}{ext}")
+        if saved is not None:
+            return saved
+    return None
 
 
 def download_video(url: str, folder: Path, quality: str) -> tuple[Path | None, str]:
+    path, error = _ytdlp_video(url, folder, quality, "")
+    if path is not None:
+        return path, ""
+    proxy = os.environ.get("YT_PROXY", "").strip()
+    if proxy:
+        print("retry on backup network")
+        path, error = _ytdlp_video(url, folder, quality, proxy)
+        if path is not None:
+            return path, ""
+    saved = cobalt_download(url, folder, bot.stable_id(url), "video", quality)
+    if saved is not None:
+        return saved, ""
+    return None, error or "unknown"
+
+
+def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str) -> tuple[Path | None, str]:
     command = [
-        *base_command(url, folder),
+        *base_command(url, folder, proxy),
         "-f",
         video_format(quality),
         "--merge-output-format",
@@ -165,17 +272,33 @@ def download_video(url: str, folder: Path, quality: str) -> tuple[Path | None, s
     ]
     completed = run_ytdlp(command)
     if completed.returncode != 0:
-        print(bot.scrub((completed.stderr or "")[-4000:]))
+        print(bot.scrub((completed.stderr or "")[-1500:]))
         return None, bot.classify_ytdlp(completed.stderr or "")
     return newest_media(folder), ""
 
 
 def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | None, str]:
+    path, error = _ytdlp_audio(url, folder, duration, "")
+    if path is not None:
+        return path, ""
+    proxy = os.environ.get("YT_PROXY", "").strip()
+    if proxy:
+        print("retry audio on backup network")
+        path, error = _ytdlp_audio(url, folder, duration, proxy)
+        if path is not None:
+            return path, ""
+    saved = cobalt_download(url, folder, bot.stable_id(url), "audio", "audio")
+    if saved is not None:
+        return saved, ""
+    return None, error or "unknown"
+
+
+def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str) -> tuple[Path | None, str]:
     selector = "bestaudio/best"
     if duration >= 3 * 60 * 60:
         selector = "bestaudio[abr<=48]/worstaudio/bestaudio"
     command = [
-        *base_command(url, folder),
+        *base_command(url, folder, proxy),
         "-x",
         "--audio-format",
         "mp3",
@@ -187,7 +310,7 @@ def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | No
     ]
     completed = run_ytdlp(command)
     if completed.returncode != 0:
-        print(bot.scrub((completed.stderr or "")[-4000:]))
+        print(bot.scrub((completed.stderr or "")[-1500:]))
         return None, bot.classify_ytdlp(completed.stderr or "")
     return newest_media(folder), ""
 
@@ -562,19 +685,9 @@ def run() -> None:
     global _reporter
     _reporter = Bar(token, chat_id, message_id)
     bot.edit_message(token, chat_id, message_id, bot.progress_text(0, "دارم دانلودش می‌کنم نیایش جانم 💙"))
-    title = video_id
+    title = bot.public_title(url) or video_id
     duration = 0
     try:
-        try:
-            info = bot.probe(url)
-            title = str(info.get("title") or title).replace("\n", " ")[:300]
-            if isinstance(info.get("duration"), (int, float)):
-                duration = int(info["duration"])
-            video_id = str(info.get("id") or video_id)
-        except RuntimeError as exc:
-            finish_error(token, chat_id, message_id, key, str(exc))
-            return
-
         if mode == "shrink-audio":
             reset_folder(folder)
             path, error = download_audio(url, folder, duration)

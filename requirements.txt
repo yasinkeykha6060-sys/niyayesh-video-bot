@@ -2,3 +2,4 @@ requests>=2.32.3,<3
 yt-dlp
 yt-dlp-ejs
 bgutil-ytdlp-pot-provider
+PySocks

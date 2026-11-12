@@ -310,6 +310,31 @@ def video_id_from_url(url: str) -> str:
     return ""
 
 
+def stable_id(url: str) -> str:
+    found = video_id_from_url(url)
+    if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", found):
+        return found
+    import hashlib
+
+    return "v" + hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def public_title(url: str) -> str:
+    try:
+        response = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return ""
+        title = response.json().get("title")
+        return str(title or "").replace("\n", " ")[:300]
+    except (requests.RequestException, ValueError):
+        return ""
+
+
 def playlist_only(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
     query = urllib.parse.parse_qs(parsed.query)
@@ -547,12 +572,15 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
     info = None
     error_kind = ""
     try:
-        info = probe(url)
-    except RuntimeError as exc:
-        error_kind = str(exc)
+        info = {
+            "id": stable_id(url),
+            "title": public_title(url) or "ویدیوی یوتیوب",
+            "duration": None,
+            "is_live": False,
+        }
     except Exception as exc:
         print(scrub(f"{exc.__class__.__name__}: {exc}"))
-        error_kind = "unknown"
+        info = {"id": stable_id(url), "title": "ویدیوی یوتیوب", "duration": None, "is_live": False}
     finally:
         stop.set()
         worker.join(4)
@@ -584,9 +612,12 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
     note = ""
     if isinstance(duration, (int, float)) and duration >= 2 * 60 * 60:
         note = "\n\nاین یکی طولانی است نیایش جانم. محدودش نمی‌کنم؛ فقط ممکن است کمی بیشتر طول بکشد 💙"
+    duration_line = ""
+    if isinstance(duration, (int, float)) and duration > 0:
+        duration_line = f"\nمدت: {format_duration(duration)}"
     text = (
-        f"نیایش جانم 💙\n{title}\n"
-        f"مدت: {format_duration(duration)}\n\n"
+        f"نیایش جانم 💙\n{title}"
+        f"{duration_line}\n\n"
         f"چطور برات بفرستم، عشقم؟{note}"
     )
     if status_id:
@@ -911,6 +942,7 @@ def self_check() -> None:
     assert merged["last_update_id"] == 5
     assert merged["jobs"]["a"]["status"] == "running"
     assert merged["allowed_chat_ids"] == [1, 2]
+    assert stable_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
     assert filling_bar(0) == "▱" * 12
     assert filling_bar(100) == "▰" * 12
     assert filling_bar(50).count("▰") == 6
