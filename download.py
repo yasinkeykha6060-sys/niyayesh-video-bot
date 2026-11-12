@@ -781,7 +781,7 @@ def upload_release(path: Path, video_id: str, title: str) -> str:
     renamed = path.with_name(asset_name)
     if renamed != path:
         path.replace(renamed)
-    notes = "بعد از ۲۴ ساعت غیرفعال می‌شود."
+    notes = "لینک دانلود."
     completed = subprocess.run(
         [
             "gh",
@@ -809,8 +809,7 @@ def upload_release(path: Path, video_id: str, title: str) -> str:
 
 def too_big_message(token: str, chat_id: int, message_id: object, video_id: str) -> None:
     text = (
-        "عزیزدلم، خود ویدیو را بزن یا لینک را.\n"
-        "لینک بعد از ۲۴ ساعت غیرفعال می‌شود."
+        "عزیزدلم، خود ویدیو را بزن یا لینک را."
     )
     bot.edit_message(token, chat_id, message_id, text, bot.delivery_keyboard(video_id))
 
@@ -967,7 +966,6 @@ def send_link(
         token,
         chat_id,
         "قربونت برم، لینک را گذاشتم ❤️\n"
-        "بعد از ۲۴ ساعت غیرفعال می‌شود.\n"
         f"{link}",
     )
     bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")
@@ -1244,7 +1242,6 @@ def run(
                 chat_id,
                 "قربونت برم، لینک را گذاشتم ❤️\n"
                 f"{note}"
-                "بعد از ۲۴ ساعت غیرفعال می‌شود.\n"
                 f"{link}",
             )
             bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")
