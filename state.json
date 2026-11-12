@@ -44,12 +44,13 @@
     "7913503227:l1dRtuhJUjQ": {
       "chat_id": 7913503227,
       "duration": 0,
+      "local_file": "l1dRtuhJUjQ.mp3",
       "message_id": 48,
       "mode": "audio",
       "quality": "audio",
-      "status": "running",
+      "status": "ready",
       "title": "Arash feat Helena - PURE LOVE ( Azizov Deep )",
-      "updated": 1794498935.4494524,
+      "updated": 1794498976.845493,
       "url": "https://youtu.be/l1dRtuhJUjQ?si=6989wRpvjHXMqhi2",
       "video_id": "l1dRtuhJUjQ"
     }
