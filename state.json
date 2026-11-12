@@ -2,6 +2,17 @@
   "allowed_chat_ids": [
     7913503227
   ],
-  "jobs": {},
-  "last_update_id": 227018028
+  "jobs": {
+    "7913503227:X0AqMgJmbNU": {
+      "chat_id": 7913503227,
+      "duration": 0,
+      "message_id": 10,
+      "status": "choosing",
+      "title": "سوخو ۲۴؛ شمشیر نیروی هوایی ایران چه توانایی‌هایی دارد؟",
+      "updated": 1794485944.571104,
+      "url": "https://youtu.be/X0AqMgJmbNU?si=fR8m-3n9rG-FVlTb",
+      "video_id": "X0AqMgJmbNU"
+    }
+  },
+  "last_update_id": 227018029
 }
