@@ -87,6 +87,7 @@ def newest_media(folder: Path) -> Path | None:
 
 
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+OUT_TIME_RE = re.compile(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 FORMATS_RE = re.compile(r"Downloading\s+(\d+)\s+format")
 
 
@@ -157,6 +158,90 @@ class Bar:
 
 
 _reporter: Bar | None = None
+
+
+class Pulse:
+    def __init__(self, token: str, chat_id: int, message_id: object, line: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.line = line
+        self.shown = 0.0
+        self.last = 0.0
+        self._stop = False
+
+    def close(self) -> None:
+        self._stop = True
+
+    def __call__(self, percent: float) -> None:
+        if self._stop:
+            return
+        shown = min(99.0, max(self.shown, float(percent)))
+        now = time.time()
+        if shown < 99 and now - self.last < 2.2 and shown - self.shown < 2:
+            return
+        self.last = now
+        self.shown = shown
+        try:
+            bot.edit_message(
+                self.token,
+                self.chat_id,
+                self.message_id,
+                bot.progress_text(shown, self.line),
+            )
+        except Exception:
+            print("progress update failed")
+
+
+def _ffmpeg_progress(
+    command: list[str],
+    length: int,
+    pulse: Pulse | None,
+    start: float,
+    end: float,
+) -> int:
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    tail: list[str] = []
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            tail.append(line)
+            if len(tail) > 40:
+                del tail[0]
+            match = OUT_TIME_RE.search(line)
+            if match is None or pulse is None or length <= 0:
+                continue
+            hours, minutes, seconds = match.groups()
+            clock = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            frac = min(1.0, clock / length)
+            pulse(start + (end - start) * frac)
+    code = proc.wait(timeout=3 * 60 * 60)
+    if code != 0:
+        print(bot.scrub("".join(tail)[-800:]))
+    return code
+
+
+def _fit_height(bits: int, source_h: int) -> int:
+    if bits >= 1_800_000:
+        height = 1080
+    elif bits >= 800_000:
+        height = 720
+    elif bits >= 350_000:
+        height = 480
+    elif bits >= 160_000:
+        height = 360
+    elif bits >= 70_000:
+        height = 240
+    else:
+        height = 144
+    if source_h > 0:
+        height = min(height, source_h)
+    return max(144, height)
 
 
 def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -594,7 +679,14 @@ def media_height(path: Path) -> int:
         return 0
 
 
-def _encode_video(path: Path, height: int, video_bits: int, audio_k: int) -> Path | None:
+def _encode_video(
+    path: Path,
+    height: int,
+    video_bits: int,
+    audio_k: int,
+    length: int,
+    pulse: Pulse | None,
+) -> Path | None:
     dest = path.with_name(f"{path.stem}-h{height}-{video_bits}.mp4")
     command = ["ffmpeg", "-y", "-i", str(path)]
     source_h = media_height(path)
@@ -602,66 +694,82 @@ def _encode_video(path: Path, height: int, video_bits: int, audio_k: int) -> Pat
         command.extend(["-vf", f"scale=-2:{height}"])
     command.extend(
         [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        str(video_bits),
-        "-maxrate",
-        str(video_bits),
-        "-bufsize",
-        str(video_bits * 2),
-        "-c:a",
-        "aac",
-        "-b:a",
-        f"{audio_k}k",
-        "-movflags",
-        "+faststart",
-        str(dest),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            str(video_bits),
+            "-maxrate",
+            str(video_bits),
+            "-bufsize",
+            str(video_bits * 2),
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_k}k",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            str(dest),
         ]
     )
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        timeout=3 * 60 * 60,
-        capture_output=True,
-    )
-    if completed.returncode != 0 or not dest.exists() or dest.stat().st_size <= 0:
-        print(bot.scrub((completed.stderr or "")[-800:]))
+    code = _ffmpeg_progress(command, length, pulse, 8, 86)
+    if code != 0 or not dest.exists() or dest.stat().st_size <= 0:
         return None
     return dest
 
 
-def compress_until_fit(path: Path, kind: str) -> Path | None:
-    """Shrink until one Telegram message can carry the file."""
+def compress_until_fit(path: Path, kind: str, pulse: Pulse | None = None) -> Path | None:
+    """One fast pass that lands inside a single Telegram message."""
     if path.stat().st_size <= TELEGRAM_LIMIT:
         return path
     length = max(media_duration(path, 0), 1)
     if kind == "audio":
-        for kbps in (160, 128, 96, 64, 48, 32, 24):
+        kbps = int((PART_BYTES * 8 * 0.9) / length / 1000)
+        kbps = min(160, max(24, kbps))
+        for _try in range(2):
             dest = path.with_name(f"{path.stem}-fit{kbps}.mp3")
-            completed = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k", str(dest)],
-                check=False,
-                text=True,
-                timeout=3 * 60 * 60,
-                capture_output=True,
+            code = _ffmpeg_progress(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    f"{kbps}k",
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
+                    str(dest),
+                ],
+                length,
+                pulse,
+                8,
+                86,
             )
-            if completed.returncode == 0 and dest.exists() and dest.stat().st_size <= TELEGRAM_LIMIT:
+            if code == 0 and dest.exists() and dest.stat().st_size <= TELEGRAM_LIMIT:
                 return dest
+            kbps = max(24, int(kbps * 0.7))
         return None
-    audio_k = 64 if length < 3600 else 32
-    budget = max(30_000, int((PART_BYTES * 8) / length) - audio_k * 1000)
-    for height in (1080, 720, 480, 360, 240, 144):
-        fitted = _encode_video(path, height, budget, audio_k)
+    audio_k = 48 if length >= 20 * 60 else 64
+    budget = max(40_000, int((PART_BYTES * 8 * 0.9) / length) - audio_k * 1000)
+    source_h = media_height(path)
+    fitted: Path | None = None
+    for _try in range(2):
+        height = _fit_height(budget, source_h)
+        fitted = _encode_video(path, height, budget, audio_k, length, pulse)
         if fitted is not None and fitted.stat().st_size <= TELEGRAM_LIMIT:
             return fitted
-        budget = max(30_000, int(budget * 0.62))
-    return None
+        budget = max(40_000, int(budget * 0.65))
+    return fitted if fitted is not None and fitted.stat().st_size <= TELEGRAM_LIMIT else None
 
 
 def pieces_for(path: Path, kind: str) -> list[Path]:
@@ -743,7 +851,7 @@ def upload_release(path: Path, video_id: str, title: str) -> str:
     renamed = path.with_name(asset_name)
     if renamed != path:
         path.replace(renamed)
-    notes = "فایل موقت برای نیایش. تا ۲۴ ساعت دیگر پاک می‌شود. هر کسی لینک را داشته باشد می‌تواند آن را ببیند."
+    notes = "بعد از ۲۴ ساعت غیرفعال می‌شود."
     completed = subprocess.run(
         [
             "gh",
@@ -771,9 +879,8 @@ def upload_release(path: Path, video_id: str, title: str) -> str:
 
 def too_big_message(token: str, chat_id: int, message_id: object, video_id: str) -> None:
     text = (
-        "عزیزدلم، این فایل برای تلگرام بزرگ است.\n"
-        "می‌توانم کیفیت را پایین‌تر بیاورم، یا لینک دانلود بگذارم.\n"
-        "اگر لینک را بخواهی، تا ۲۴ ساعت می‌ماند و هر کسی لینک را داشته باشد می‌تواند آن را ببیند."
+        "عزیزدلم، خود ویدیو را بزن یا لینک را.\n"
+        "لینک بعد از ۲۴ ساعت غیرفعال می‌شود."
     )
     bot.edit_message(token, chat_id, message_id, text, bot.delivery_keyboard(video_id))
 
@@ -863,20 +970,39 @@ def send_fitted(
 ) -> bool:
     if not claim_send(key):
         return False
-    bot.edit_message(token, chat_id, message_id, "دارم آماده‌اش می‌کنم که همین‌جا پخش شود ❤️")
-    fitted = compress_until_fit(path, kind)
+    line = "دارم آماده‌اش می‌کنم که همین‌جا پخش شود ❤️"
+    pulse = Pulse(token, chat_id, message_id, line)
+    pulse(8)
+    fitted = compress_until_fit(path, kind, pulse)
     parts = [fitted] if fitted is not None else []
     if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
+        pulse(70)
         parts = pieces_for(path, kind)
     if not parts or any(part.stat().st_size > TELEGRAM_LIMIT for part in parts):
+        pulse.close()
         mark(key, status="error", quality=quality, claim="")
         impossible_message(token, chat_id, message_id)
         return True
-    total = len(parts)
-    for index, part in enumerate(parts, start=1):
-        send_media(token, chat_id, part, kind, title, index, total)
-        if index != total:
-            time.sleep(1)
+    stop = threading.Event()
+
+    def creep() -> None:
+        percent = max(pulse.shown, 88.0)
+        while not stop.is_set() and percent < 97:
+            if stop.wait(1.5):
+                return
+            percent = min(97.0, percent + 3)
+            pulse(percent)
+
+    threading.Thread(target=creep, daemon=True).start()
+    try:
+        total = len(parts)
+        for index, part in enumerate(parts, start=1):
+            send_media(token, chat_id, part, kind, title, index, total)
+            if index != total:
+                time.sleep(1)
+    finally:
+        stop.set()
+        pulse.close()
     bot.edit_message(token, chat_id, message_id, "تقدیم با عشق نیایشم ❤️")
     mark(key, status="done", quality=quality, claim="")
     return True
@@ -910,9 +1036,8 @@ def send_link(
     bot.send_message(
         token,
         chat_id,
-        "قربونت برم، لینک دانلود را گذاشتم.\n"
-        "تا ۲۴ ساعت می‌ماند و بعد پاک می‌شود.\n"
-        "اگر این نشانی را برای کسی بفرستی، او هم می‌تواند بازش کند.\n"
+        "قربونت برم، لینک را گذاشتم ❤️\n"
+        "بعد از ۲۴ ساعت غیرفعال می‌شود.\n"
         f"{link}",
     )
     bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")
@@ -1187,10 +1312,9 @@ def run(
             bot.send_message(
                 token,
                 chat_id,
-                "قربونت برم، لینک دانلود را گذاشتم.\n"
+                "قربونت برم، لینک را گذاشتم ❤️\n"
                 f"{note}"
-                "چون ریپو عمومی است، هر کسی این لینک را داشته باشد می‌تواند فایل را ببیند.\n"
-                "تا ۲۴ ساعت دیگر خودبه‌خود پاک می‌شود.\n"
+                "بعد از ۲۴ ساعت غیرفعال می‌شود.\n"
                 f"{link}",
             )
             bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم ❤️")

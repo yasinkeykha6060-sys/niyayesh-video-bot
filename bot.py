@@ -28,7 +28,7 @@ STALE_SECONDS = 6 * 60 * 60
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 TOKEN_LIKE_RE = re.compile(r"\d{6,}\s*:\s*[A-Za-z0-9_-]{20,}")
 YOUTUBE_RE = re.compile(
-    r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+",
+    r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtube-nocookie\.com|youtu\.be)/\S+",
     re.IGNORECASE,
 )
 
@@ -316,7 +316,7 @@ def video_id_from_url(url: str) -> str:
     if query.get("v") and query["v"][0]:
         return query["v"][0][:32]
     parts = [part for part in parsed.path.split("/") if part]
-    for key in ("shorts", "embed", "live", "v"):
+    for key in ("shorts", "embed", "live", "v", "clip", "post"):
         if key in parts:
             index = parts.index(key)
             if index + 1 < len(parts):
@@ -1104,6 +1104,11 @@ def self_check() -> None:
     assert video_id_from_url(urls[0]) == "dQw4w9WgXcQ"
     assert video_id_from_url("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
     assert video_id_from_url("https://m.youtube.com/shorts/abcdefghijk") == "abcdefghijk"
+    assert video_id_from_url("https://www.youtube.com/shorts/abcdefghijk?si=abc") == "abcdefghijk"
+    assert video_id_from_url("https://youtube.com/live/abcdefghijk") == "abcdefghijk"
+    assert video_id_from_url("https://www.youtube.com/clip/abcdefghijk") == "abcdefghijk"
+    assert video_id_from_url("https://www.youtube.com/post/Ugkxabcdefghijk") == "Ugkxabcdefghijk"
+    assert youtube_urls("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
     assert playlist_only("https://www.youtube.com/playlist?list=PL123")
     assert not playlist_only(urls[0])
     assert format_duration(3661).startswith("۱")

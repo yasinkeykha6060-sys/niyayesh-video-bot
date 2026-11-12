@@ -243,6 +243,30 @@ def prove_pack() -> bool:
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def prove_short(proxy: str) -> bool:
+    url = "https://www.youtube.com/shorts/X0AqMgJmbNU"
+    if bot.video_id_from_url(url) != "X0AqMgJmbNU":
+        print("FAIL short id")
+        return False
+    command = [
+        *bot.ytdlp_base(url, CLIENT),
+        "--skip-download",
+        "-O",
+        "id:%(id)s",
+        "--proxy",
+        proxy,
+        url,
+    ]
+    completed = subprocess.run(command, check=False, text=True, timeout=90, capture_output=True)
+    text = (completed.stdout or "") + (completed.stderr or "")
+    print(text.strip()[-240:])
+    if "id:X0AqMgJmbNU" not in text:
+        print("FAIL short")
+        return False
+    print("PASS short")
+    return True
+
+
 def main() -> int:
     if not prove_pack():
         return 1
@@ -252,6 +276,8 @@ def main() -> int:
         print("clean network is required")
         return 1
     activate_proxy(proxy)
+    if not prove_short(proxy):
+        return 1
     if OUT.exists():
         shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
