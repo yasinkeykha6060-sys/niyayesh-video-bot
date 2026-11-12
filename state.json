@@ -1,6 +1,7 @@
 {
   "allowed_chat_ids": [
-    7913503227
+    7913503227,
+    1221862634
   ],
   "jobs": {
     "7913503227:1ETihCB66EI": {
@@ -56,5 +57,5 @@
       "video_id": "l1dRtuhJUjQ"
     }
   },
-  "last_update_id": 227018065
+  "last_update_id": 227018066
 }
