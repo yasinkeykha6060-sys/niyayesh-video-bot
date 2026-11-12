@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import bot
@@ -58,33 +59,47 @@ def available_heights(proxy: str) -> list[int]:
 
 
 def download_mode(label: str, proxy: str, audio: bool) -> Path | None:
-    folder = OUT / label
-    if folder.exists():
-        shutil.rmtree(folder, ignore_errors=True)
-    folder.mkdir(parents=True, exist_ok=True)
-    if audio:
-        extra = ["-x", "--audio-format", "mp3", "--audio-quality", "192K", "-f", download.audio_format(0)]
-    else:
-        extra = ["-f", download.video_format(label), "--merge-output-format", "mp4"]
-    command = [
-        *bot.ytdlp_base(URL, CLIENT),
-        "--newline",
-        *extra,
-        "--max-filesize",
-        "400M",
-        "-o",
-        str(folder / "%(id)s.%(ext)s"),
-    ]
-    if proxy:
-        command.extend(["--proxy", proxy])
-    command.append(URL)
-    completed = subprocess.run(command, check=False, text=True, timeout=420, capture_output=True)
-    files = [path for path in folder.rglob("*") if looks_like_media(path)]
-    if not files:
-        detail = ((completed.stderr or "") + (completed.stdout or ""))[-800:]
-        print(detail)
-        return None
-    return max(files, key=lambda path: path.stat().st_size)
+    floor = {"720": 480, "1080": 720, "best": 720}.get(label, 0)
+    last_detail = ""
+    for attempt in range(3):
+        folder = OUT / label
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        if audio:
+            extra = ["-x", "--audio-format", "mp3", "--audio-quality", "192K", "-f", download.audio_format(0)]
+        else:
+            extra = ["-f", download.video_format(label), "--merge-output-format", "mp4"]
+        command = [
+            *bot.ytdlp_base(URL, CLIENT),
+            "--newline",
+            *extra,
+            "--max-filesize",
+            "400M",
+            "-o",
+            str(folder / "%(id)s.%(ext)s"),
+        ]
+        if proxy:
+            command.extend(["--proxy", proxy])
+        command.append(URL)
+        completed = subprocess.run(command, check=False, text=True, timeout=420, capture_output=True)
+        files = [path for path in folder.rglob("*") if looks_like_media(path)]
+        if not files:
+            last_detail = ((completed.stderr or "") + (completed.stdout or ""))[-800:]
+            print(f"retry {label} attempt {attempt + 1} no file")
+            time.sleep(3)
+            continue
+        saved = max(files, key=lambda path: path.stat().st_size)
+        if audio or floor == 0:
+            return saved
+        seen, _seconds = probe(saved)
+        if seen + 40 >= floor:
+            return saved
+        print(f"retry {label} attempt {attempt + 1} height {seen}")
+        time.sleep(3)
+    if last_detail:
+        print(last_detail)
+    return None
 
 
 def probe(path: Path) -> tuple[int, float]:
@@ -217,7 +232,7 @@ def prove_pack() -> bool:
             return False
         fitted = download.pieces_for(short_video, "video")
         print("pack fit", [part.stat().st_size for part in fitted])
-        if len(fitted) != 1 or fitted[0].stat().st_size > download.TELEGRAM_LIMIT:
+        if not fitted or any(part.stat().st_size > download.TELEGRAM_LIMIT or part.stat().st_size <= 0 for part in fitted):
             print("FAIL pack fit")
             return False
         download.TELEGRAM_LIMIT = 400_000

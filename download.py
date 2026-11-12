@@ -36,8 +36,8 @@ def guessed_bytes(duration: int, quality: str) -> int:
 
 
 def video_format(quality: str) -> str:
-    # A single https file first. Split streams are only the backup, so the bar
-    # is the whole video and YouTube's tiny pieces are not used.
+    # Stay on the requested height. The loose combined-file fallback used to
+    # accept the 360p progressive file whenever the taller streams blinked.
     if quality == "best":
         return video_format("1080")
     height = quality if quality in {"360", "720", "1080"} else "720"
@@ -47,9 +47,9 @@ def video_format(quality: str) -> str:
         f"bv*[height<={height}]{tall}[ext=mp4][vcodec^=avc1][protocol=https]+ba[ext=m4a][protocol=https]/"
         f"b[height<={height}]{tall}[ext=mp4][vcodec^=avc1][protocol=https]/"
         f"bv*[height<={height}]{tall}[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
-        f"b[height<={height}][ext=mp4][protocol=https]/"
-        f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
-        f"b[height<={height}]/b"
+        f"bv*[height<={height}]{tall}[ext=mp4]+ba[ext=m4a]/"
+        f"bv*[height<={height}]{tall}+ba/"
+        f"b[height<={height}]{tall}"
     )
 
 
@@ -301,7 +301,9 @@ def _clear_partials(folder: Path) -> None:
 
 
 def _client_order(kind: str, quality: str) -> tuple[str, ...]:
-    return ("web_embedded,android", "", "android", "tv")
+    # The first client is the one that actually gets the tall file. Retry it
+    # before wandering off, because YouTube sometimes answers with only 360p.
+    return ("web_embedded,android", "web_embedded,android", "web_embedded,android", "android", "tv")
 
 
 def _attempt(kind: str, url: str, folder: Path, quality: str, duration: int) -> tuple[Path | None, str]:
@@ -325,6 +327,8 @@ def _attempt(kind: str, url: str, folder: Path, quality: str, duration: int) -> 
                 continue
             if error:
                 last = error
+            if error in {"forbidden", "bot", "short", ""}:
+                time.sleep(3)
     if saw_age and last == "unknown":
         return None, "age"
     return None, last
@@ -430,6 +434,44 @@ def download_video(url: str, folder: Path, quality: str) -> tuple[Path | None, s
     return None, error or "unknown"
 
 
+def file_height(path: Path) -> int:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=height",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            check=False,
+            text=True,
+            timeout=60,
+            capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return -1
+    try:
+        return int((completed.stdout or "0").strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def tall_enough(path: Path, quality: str) -> bool:
+    floor = {"720": 480, "1080": 720, "best": 720}.get(quality)
+    if floor is None:
+        return True
+    seen = file_height(path)
+    if seen < 0:
+        return True
+    return seen + 40 >= floor
+
+
 def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str, clients: str = "") -> tuple[Path | None, str]:
     command = [
         *base_command(url, folder, proxy, clients),
@@ -443,7 +485,14 @@ def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str, clients: str 
     if completed.returncode != 0:
         print(bot.scrub((completed.stderr or "")[-1500:]))
         return None, bot.classify_ytdlp(completed.stderr or "")
-    return newest_media(folder), ""
+    saved = newest_media(folder)
+    if saved is None:
+        return None, bot.classify_ytdlp(completed.stderr or "") or "unknown"
+    if not tall_enough(saved, quality):
+        print(f"too short for {quality}", flush=True)
+        saved.unlink(missing_ok=True)
+        return None, "short"
+    return saved, ""
 
 
 def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | None, str]:
@@ -542,58 +591,15 @@ def compress_audio(path: Path, max_bytes: int, duration: int, min_kbps: int = 32
     return dest
 
 
-def compress_video_fast(path: Path, video_bits: int) -> Path | None:
-    if video_bits < 450_000:
-        return None
-    dest = path.with_name(f"{path.stem}-fit.mp4")
-    completed = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(path),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-b:v",
-            str(video_bits),
-            "-maxrate",
-            str(video_bits),
-            "-bufsize",
-            str(video_bits * 2),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ],
-        check=False,
-        text=True,
-        timeout=3 * 60 * 60,
-        capture_output=True,
-    )
-    if completed.returncode != 0 or not dest.exists() or dest.stat().st_size > TELEGRAM_LIMIT:
-        print(bot.scrub((completed.stderr or "")[-1500:]))
-        return None
-    return dest
-
-
 def split_media(path: Path, depth: int = 0) -> list[Path]:
     if path.stat().st_size <= TELEGRAM_LIMIT:
         return [path]
     if depth >= 3:
-        length = max(media_duration(path, 0), 1)
         if path.suffix.lower() == ".mp3":
+            length = max(media_duration(path, 0), 1)
             fitted = compress_audio(path, PART_BYTES, length, min_kbps=32)
             return [fitted] if fitted is not None else []
-        bits = max(450_000, int((PART_BYTES * 8) / length) - 96_000)
-        fitted = compress_video_fast(path, bits)
-        return [fitted] if fitted is not None else []
+        return []
     size = path.stat().st_size
     length = max(media_duration(path, 0), 1)
     seconds = max(12.0, (PART_BYTES / size) * length * 0.75)
@@ -712,12 +718,6 @@ def pieces_for(path: Path, kind: str) -> list[Path]:
         if fitted is not None:
             return [fitted]
         return split_media(path)
-    if length > 0:
-        video_bits = int((PART_BYTES * 8) / length) - 128_000
-        if video_bits >= 700_000:
-            fitted = compress_video_fast(path, video_bits)
-            if fitted is not None:
-                return [fitted]
     return split_media(path)
 
 
