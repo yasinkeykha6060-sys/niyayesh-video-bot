@@ -61,15 +61,15 @@
       "claim": "",
       "duration": 0,
       "local_file": "l1dRtuhJUjQ.mp3",
-      "message_id": 48,
+      "message_id": 80,
       "mode": "audio",
       "quality": "audio",
-      "status": "done",
+      "status": "choosing",
       "title": "Arash feat Helena - PURE LOVE ( Azizov Deep )",
-      "updated": 1794499020.3129473,
+      "updated": 1794508395.3627477,
       "url": "https://youtu.be/l1dRtuhJUjQ?si=6989wRpvjHXMqhi2",
       "video_id": "l1dRtuhJUjQ"
     }
   },
-  "last_update_id": 227018076
+  "last_update_id": 227018077
 }
