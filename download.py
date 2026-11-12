@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""دانلود یک ویدیو یا صدای یوتیوب و فرستادن آن برای نیایش.
+
+این فایل را workflow دانلود اجرا می‌کند و بعد تمام می‌شود.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+import bot
+
+ROOT = bot.ROOT
+TELEGRAM_LIMIT = 49 * 1024 * 1024
+RELEASE_LIMIT = 1800 * 1024 * 1024
+QUALITY_ORDER = ["best", "1080", "720", "360"]
+DISK_SAFE = 8 * 1024 * 1024 * 1024
+GUESSED_BITRATE = {"best": 8_000_000, "1080": 5_000_000, "720": 2_500_000, "360": 800_000}
+
+
+def guessed_bytes(duration: int, quality: str) -> int:
+    if duration <= 0:
+        return 0
+    return int(duration * GUESSED_BITRATE.get(quality, 2_500_000) / 8)
+
+
+def video_format(quality: str) -> str:
+    if quality == "best":
+        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    height = quality if quality in {"360", "720", "1080"} else "720"
+    return (
+        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}]/best"
+    )
+
+
+def step_down(quality: str) -> str | None:
+    if quality not in QUALITY_ORDER:
+        return "720"
+    index = QUALITY_ORDER.index(quality)
+    if index + 1 < len(QUALITY_ORDER):
+        return QUALITY_ORDER[index + 1]
+    return None
+
+
+def work_dir(video_id: str) -> Path:
+    path = ROOT / "downloads" / video_id
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def newest_media(folder: Path) -> Path | None:
+    files = [
+        path
+        for path in folder.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mp3", ".m4a"}
+        and path.stat().st_size > 0
+    ]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
+    print("yt-dlp start", flush=True)
+    try:
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            timeout=5 * 60 * 60,
+            capture_output=True,
+        )
+    finally:
+        bot.clear_cookies()
+
+
+def base_command(url: str, folder: Path) -> list[str]:
+    extra = ["--playlist-items", "1"] if bot.playlist_only(url) else ["--no-playlist"]
+    return [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--no-warnings",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--socket-timeout",
+        "30",
+        "-o",
+        str(folder / "%(id)s.%(ext)s"),
+        *extra,
+        *bot.cookies_args(),
+    ]
+
+
+def download_video(url: str, folder: Path, quality: str) -> tuple[Path | None, str]:
+    command = [
+        *base_command(url, folder),
+        "-f",
+        video_format(quality),
+        "--merge-output-format",
+        "mp4",
+        url,
+    ]
+    completed = run_ytdlp(command)
+    if completed.returncode != 0:
+        print(bot.scrub((completed.stderr or "")[-4000:]))
+        return None, bot.classify_ytdlp(completed.stderr or "")
+    return newest_media(folder), ""
+
+
+def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | None, str]:
+    selector = "bestaudio/best"
+    if duration >= 3 * 60 * 60:
+        selector = "bestaudio[abr<=48]/worstaudio/bestaudio"
+    command = [
+        *base_command(url, folder),
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "192K" if duration < 3 * 60 * 60 else "48K",
+        "-f",
+        selector,
+        url,
+    ]
+    completed = run_ytdlp(command)
+    if completed.returncode != 0:
+        print(bot.scrub((completed.stderr or "")[-4000:]))
+        return None, bot.classify_ytdlp(completed.stderr or "")
+    return newest_media(folder), ""
+
+
+def ensure_mp4(path: Path) -> Path:
+    if path.suffix.lower() == ".mp4":
+        return path
+    dest = path.with_suffix(".mp4")
+    completed = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(path), "-c", "copy", str(dest)],
+        check=False,
+        text=True,
+        timeout=60 * 60,
+        capture_output=True,
+    )
+    if completed.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        path.unlink(missing_ok=True)
+        return dest
+    print("remux failed; keeping the original file")
+    return path
+
+
+def media_duration(path: Path, fallback: int) -> int:
+    if fallback > 0:
+        return fallback
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ],
+        check=False,
+        text=True,
+        timeout=60,
+        capture_output=True,
+    )
+    try:
+        return int(float((completed.stdout or "").strip()))
+    except ValueError:
+        return 0
+
+
+def compress_audio(path: Path, max_bytes: int, duration: int) -> Path | None:
+    length = media_duration(path, duration)
+    if length <= 0:
+        return None
+    kbps = int((max_bytes * 8) / length / 1000)
+    if kbps < 32:
+        return None
+    kbps = min(kbps, 192)
+    dest = path.with_name(f"{path.stem}-{kbps}.mp3")
+    completed = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(path), "-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k", str(dest)],
+        check=False,
+        text=True,
+        timeout=5 * 60 * 60,
+        capture_output=True,
+    )
+    if completed.returncode != 0 or not dest.exists() or dest.stat().st_size > max_bytes:
+        print(bot.scrub((completed.stderr or "")[-1500:]))
+        return None
+    return dest
+
+
+def compress_to_fit(path: Path, duration: int) -> Path | None:
+    if duration <= 0:
+        return None
+    bits = int((TELEGRAM_LIMIT * 8) / duration) - 96_000
+    if bits < 80_000:
+        return None
+    dest = path.with_name(f"{path.stem}-small.mp4")
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(path),
+            "-vf",
+            "scale=-2:360",
+            "-c:v",
+            "libx264",
+            "-b:v",
+            str(bits),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            str(dest),
+        ],
+        check=False,
+        text=True,
+        timeout=5 * 60 * 60,
+        capture_output=True,
+    )
+    if completed.returncode != 0 or not dest.exists():
+        print(bot.scrub((completed.stderr or "")[-2000:]))
+        return None
+    if dest.stat().st_size <= TELEGRAM_LIMIT:
+        return dest
+    return None
+
+
+def send_media(token: str, chat_id: int, path: Path, kind: str, title: str) -> None:
+    method = "sendAudio" if kind == "audio" else "sendVideo"
+    field = "audio" if kind == "audio" else "video"
+    caption = f"نیایش جانم 💙\n{title}"[:1000]
+    data = {"chat_id": str(chat_id), "caption": caption}
+    if kind == "audio":
+        data["title"] = title[:64]
+    else:
+        data["supports_streaming"] = "true"
+    with path.open("rb") as handle:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=data,
+            files={field: handle},
+            timeout=900,
+        )
+    if response.status_code in (401, 404):
+        raise bot.FatalTokenError()
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if response.status_code >= 400 or not body.get("ok"):
+        print(f"upload failed status={response.status_code}")
+        raise bot.TelegramError(method, str(body.get("description") or "upload failed"), response.status_code)
+
+
+def upload_release(path: Path, video_id: str, title: str) -> str:
+    tag = f"yt-{video_id}-{int(time.time())}"
+    asset_name = f"{video_id}{path.suffix.lower()}"
+    renamed = path.with_name(asset_name)
+    if renamed != path:
+        path.replace(renamed)
+    notes = "فایل موقت برای نیایش. تا ۲۴ ساعت دیگر پاک می‌شود. هر کسی لینک را داشته باشد می‌تواند آن را ببیند."
+    completed = subprocess.run(
+        [
+            "gh",
+            "release",
+            "create",
+            tag,
+            str(renamed),
+            "--title",
+            title[:80] or video_id,
+            "--notes",
+            notes,
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        timeout=60 * 60,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        print(bot.scrub((completed.stderr or completed.stdout or "")[-2000:]))
+        raise RuntimeError("release failed")
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    return f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
+
+
+def too_big_message(token: str, chat_id: int, message_id: object, video_id: str) -> None:
+    text = (
+        "عزیزدلم، این فایل برای تلگرام بزرگ است.\n"
+        "می‌توانم کیفیت را پایین‌تر بیاورم، یا لینک دانلود بگذارم.\n"
+        "اگر لینک را بخواهی، تا ۲۴ ساعت می‌ماند و هر کسی لینک را داشته باشد می‌تواند آن را ببیند."
+    )
+    bot.edit_message(token, chat_id, message_id, text, bot.delivery_keyboard(video_id))
+
+
+def impossible_message(token: str, chat_id: int, message_id: object) -> None:
+    bot.edit_message(
+        token,
+        chat_id,
+        message_id,
+        "نیایش جانم، این یکی آن‌قدر بزرگ است که حتی با کیفیت پایین هم این‌جا جا نمی‌شود. "
+        "اگر بخش کوتاه‌تری را بفرستی، برات می‌گیرم 💙",
+    )
+
+
+def mark(key: str, **fields: object) -> None:
+    state = bot.load_state()
+    bot.put_job(state, key, **fields)
+    bot.save_state(state)
+    bot.publish_state()
+
+
+def send_or_offer(
+    token: str,
+    chat_id: int,
+    message_id: object,
+    path: Path,
+    kind: str,
+    title: str,
+    video_id: str,
+    key: str,
+    quality: str,
+) -> None:
+    size = path.stat().st_size
+    if size <= TELEGRAM_LIMIT:
+        bot.edit_message(token, chat_id, message_id, "گرفتمش عزیزدلم، دارم می‌فرستمش برات 💙")
+        send_media(token, chat_id, path, kind, title)
+        bot.edit_message(token, chat_id, message_id, "رسید نیایش جانم 💙")
+        mark(key, status="done", quality=quality)
+        return
+    if size <= RELEASE_LIMIT:
+        mark(key, status="too_big", quality=quality)
+        too_big_message(token, chat_id, message_id, video_id)
+        return
+    mark(key, status="error", quality=quality)
+    impossible_message(token, chat_id, message_id)
+
+
+def download_requested(
+    url: str,
+    folder: Path,
+    mode: str,
+    quality: str,
+    duration: int,
+) -> tuple[Path | None, str, str]:
+    if mode == "audio":
+        path, error = download_audio(url, folder, duration)
+        if path is None and error not in {"bot", "private", "age", "unavailable"}:
+            path, error = download_audio(url, folder, duration)
+        return path, "audio", error
+    current = quality if quality in QUALITY_ORDER else "best"
+    attempts = 0
+    while current:
+        if duration and guessed_bytes(duration, current) > DISK_SAFE:
+            nxt = step_down(current)
+            if nxt:
+                print(f"skip quality={current}")
+                current = nxt
+                continue
+            return None, "video", "huge"
+        path, error = download_video(url, folder, current)
+        if path is not None:
+            return ensure_mp4(path), "video", ""
+        if error in {"bot", "private", "age", "unavailable"}:
+            return None, "video", error
+        attempts += 1
+        nxt = step_down(current)
+        if attempts >= 2 or not nxt:
+            return None, "video", error or "unknown"
+        print(f"retry quality={nxt}")
+        current = nxt
+    return None, "video", "unknown"
+
+
+def reset_folder(folder: Path) -> None:
+    if folder.exists():
+        shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+def shrink(url: str, folder: Path, quality: str, duration: int) -> tuple[Path | None, str]:
+    current = step_down(quality) or "360"
+    while current:
+        if duration and guessed_bytes(duration, current) > DISK_SAFE:
+            nxt = step_down(current)
+            if not nxt:
+                return None, "huge"
+            current = nxt
+            continue
+        reset_folder(folder)
+        path, error = download_video(url, folder, current)
+        if error in {"bot", "private", "age", "unavailable"}:
+            return None, error
+        if path is None:
+            nxt = step_down(current)
+            if not nxt:
+                return None, error or "unknown"
+            current = nxt
+            continue
+        path = ensure_mp4(path)
+        if path.stat().st_size <= TELEGRAM_LIMIT:
+            return path, current
+        nxt = step_down(current)
+        if nxt and nxt != current:
+            current = nxt
+            continue
+        smaller = compress_to_fit(path, duration)
+        if smaller is not None:
+            return smaller, current
+        return path, current
+    return None, "huge"
+
+
+def release_file(
+    url: str,
+    folder: Path,
+    mode: str,
+    quality: str,
+    duration: int,
+) -> tuple[Path | None, str, str]:
+    if mode == "audio" or quality == "audio":
+        reset_folder(folder)
+        path, error = download_audio(url, folder, duration)
+        if path is None:
+            return None, "audio", error or "unknown"
+        if path.stat().st_size > RELEASE_LIMIT:
+            smaller = compress_audio(path, RELEASE_LIMIT, duration)
+            if smaller is None:
+                return path, "audio", "huge"
+            path = smaller
+        return path, "audio", "audio"
+
+    current = quality if quality in QUALITY_ORDER else "best"
+    while current:
+        if duration and guessed_bytes(duration, current) > RELEASE_LIMIT:
+            nxt = step_down(current)
+            if not nxt:
+                return None, "video", "huge"
+            current = nxt
+            continue
+        reset_folder(folder)
+        path, error = download_video(url, folder, current)
+        if error in {"bot", "private", "age", "unavailable"}:
+            return None, "video", error
+        if path is None:
+            nxt = step_down(current)
+            if not nxt:
+                return None, "video", error or "unknown"
+            current = nxt
+            continue
+        path = ensure_mp4(path)
+        if path.stat().st_size <= RELEASE_LIMIT:
+            return path, "video", current
+        nxt = step_down(current)
+        if not nxt:
+            return path, "video", "huge"
+        current = nxt
+    return None, "video", "huge"
+
+
+def finish_error(token: str, chat_id: int, message_id: object, key: str, kind: str) -> None:
+    mark(key, status="error")
+    bot.edit_message(token, chat_id, message_id, bot.friendly_probe_error(kind))
+
+
+def run() -> None:
+    token = bot.load_token()
+    if not token:
+        print("BOT_TOKEN is not set.", file=sys.stderr)
+        sys.exit(1)
+    chat_raw = os.environ.get("CHAT_ID", "").strip()
+    url = os.environ.get("VIDEO_URL", "").strip()
+    mode = os.environ.get("MODE", "").strip()
+    quality = os.environ.get("QUALITY", "").strip() or "best"
+    video_id = os.environ.get("VIDEO_ID", "").strip()
+    message_raw = os.environ.get("MESSAGE_ID", "").strip()
+    if not chat_raw.lstrip("-").isdigit() or not bot.youtube_urls(url):
+        print("bad download request")
+        sys.exit(1)
+    chat_id = int(chat_raw)
+    message_id = int(message_raw) if message_raw.lstrip("-").isdigit() else 0
+    if not video_id:
+        video_id = bot.video_id_from_url(url)
+    key = bot.job_key(chat_id, video_id)
+    folder = work_dir(video_id)
+    mark(key, status="running", mode=mode, quality=quality, chat_id=chat_id, url=url, video_id=video_id)
+    bot.edit_message(token, chat_id, message_id, "دارم دانلودش می‌کنم نیایش جانم 💙")
+    title = video_id
+    duration = 0
+    try:
+        try:
+            info = bot.probe(url)
+            title = str(info.get("title") or title).replace("\n", " ")[:300]
+            if isinstance(info.get("duration"), (int, float)):
+                duration = int(info["duration"])
+            video_id = str(info.get("id") or video_id)
+        except RuntimeError as exc:
+            finish_error(token, chat_id, message_id, key, str(exc))
+            return
+
+        if mode == "shrink-audio":
+            reset_folder(folder)
+            path, error = download_audio(url, folder, duration)
+            if path is None:
+                finish_error(token, chat_id, message_id, key, error or "unknown")
+                return
+            if path.stat().st_size > TELEGRAM_LIMIT:
+                smaller = compress_audio(path, TELEGRAM_LIMIT, duration)
+                path = smaller or path
+            if path.stat().st_size > TELEGRAM_LIMIT:
+                mark(key, status="too_big", mode="audio", quality="audio")
+                too_big_message(token, chat_id, message_id, video_id)
+                return
+            send_or_offer(token, chat_id, message_id, path, "audio", title, video_id, key, "audio")
+            return
+
+        if mode == "shrink":
+            path, outcome = shrink(url, folder, quality, duration)
+            if path is None:
+                if outcome == "huge":
+                    mark(key, status="too_big", quality=quality)
+                    too_big_message(token, chat_id, message_id, video_id)
+                    return
+                finish_error(token, chat_id, message_id, key, outcome or "unknown")
+                return
+            if path.stat().st_size > TELEGRAM_LIMIT:
+                mark(key, status="too_big", quality=str(outcome))
+                too_big_message(token, chat_id, message_id, video_id)
+                return
+            send_or_offer(token, chat_id, message_id, path, "video", title, video_id, key, str(outcome))
+            return
+
+        if mode == "release":
+            wanted = "audio" if quality == "audio" or mode == "audio" else "video"
+            path, kind, outcome = release_file(url, folder, wanted, quality, duration)
+            if wanted == "video" and outcome == "huge":
+                bot.edit_message(
+                    token,
+                    chat_id,
+                    message_id,
+                    "عزیزدلم، خود ویدیو آن‌قدر بزرگ است که این‌جا جا نمی‌شود. صداش را برات می‌گذارم 💙",
+                )
+                path, kind, outcome = release_file(url, folder, "audio", "audio", duration)
+            if path is None or outcome == "huge" or path.stat().st_size > RELEASE_LIMIT:
+                if outcome in {"bot", "private", "age", "unavailable"}:
+                    finish_error(token, chat_id, message_id, key, outcome)
+                    return
+                mark(key, status="error")
+                impossible_message(token, chat_id, message_id)
+                return
+            note = ""
+            if kind == "audio" and quality != "audio":
+                note = "خود تصویر این‌جا جا نشد، برای همین صدا را گذاشتم.\n"
+            bot.edit_message(token, chat_id, message_id, "فایل آماده است عزیزدلم، دارم لینکش را می‌گذارم 💙")
+            link = upload_release(path, video_id, title)
+            bot.send_message(
+                token,
+                chat_id,
+                "قربونت برم، لینک دانلود را گذاشتم.\n"
+                f"{note}"
+                "چون ریپو عمومی است، هر کسی این لینک را داشته باشد می‌تواند فایل را ببیند.\n"
+                "تا ۲۴ ساعت دیگر خودبه‌خود پاک می‌شود.\n"
+                f"{link}",
+            )
+            bot.edit_message(token, chat_id, message_id, "لینک را فرستادم نیایش جانم 💙")
+            mark(key, status="done", quality=str(outcome), mode=kind)
+            return
+
+        path, kind, error = download_requested(url, folder, mode, quality, duration)
+        if path is None and error == "huge":
+            mark(key, status="too_big", quality=quality)
+            too_big_message(token, chat_id, message_id, video_id)
+            return
+        if path is None:
+            finish_error(token, chat_id, message_id, key, error or "unknown")
+            return
+        send_or_offer(token, chat_id, message_id, path, kind, title, video_id, key, quality)
+    except bot.FatalTokenError:
+        print("BOT_TOKEN was rejected by Telegram.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(bot.scrub(f"{exc.__class__.__name__}: {exc}"), file=sys.stderr)
+        try:
+            mark(key, status="error")
+            bot.edit_message(token, chat_id, message_id, bot.friendly_probe_error("unknown"))
+        except Exception as nested:
+            print(bot.scrub(nested.__class__.__name__), file=sys.stderr)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+        bot.clear_cookies()
+
+
+if __name__ == "__main__":
+    run()

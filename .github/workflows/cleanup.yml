@@ -1,0 +1,38 @@
+name: Cleanup releases
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete releases older than 24 hours
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - << 'PY'
+          import json, os, subprocess
+          from datetime import datetime, timedelta, timezone
+
+          raw = subprocess.check_output(
+              ["gh", "release", "list", "--limit", "200", "--json", "tagName,createdAt"],
+              text=True,
+          )
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+          for item in json.loads(raw):
+              tag = item.get("tagName") or ""
+              if not tag.startswith("yt-"):
+                  continue
+              created = datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00"))
+              if created > cutoff:
+                  continue
+              print(f"delete {tag}")
+              subprocess.run(["gh", "release", "delete", tag, "--yes", "--cleanup-tag"], check=False)
+          PY

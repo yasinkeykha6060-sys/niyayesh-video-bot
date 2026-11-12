@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""ربات دانلود یوتیوب نیایش.
+
+پروسهٔ همیشه‌روشن روی کامپیوتر نیست. گیت‌هاب اکشنز این فایل را بیدار نگه می‌دارد،
+چند ساعت گوش می‌دهد، بعد اجرا را به نوبت بعدی می‌سپارد. توکن فقط از محیط خوانده می‌شود.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+import requests
+
+ROOT = Path(__file__).resolve().parent
+STATE_PATH = ROOT / "state.json"
+ACTIVE = {"queued", "running"}
+STALE_SECONDS = 6 * 60 * 60
+FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+TOKEN_LIKE_RE = re.compile(r"\d{6,}\s*:\s*[A-Za-z0-9_-]{20,}")
+YOUTUBE_RE = re.compile(
+    r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+",
+    re.IGNORECASE,
+)
+
+COMMANDS = [
+    {"command": "start", "description": "سلام و طرز کار"},
+    {"command": "help", "description": "راهنمای کوتاه"},
+]
+
+
+class FatalTokenError(Exception):
+    """تلگرام توکن را نپذیرفت. متن خالی می‌ماند تا توکن در لاگ نیاید."""
+
+
+class TelegramError(Exception):
+    def __init__(self, method: str, description: str, status: int = 0):
+        super().__init__(description)
+        self.method = method
+        self.description = description
+        self.status = status
+
+
+def fa(text: str) -> str:
+    return str(text).translate(FA_DIGITS)
+
+
+def scrub(text: str) -> str:
+    secret_values = [
+        os.environ.get("BOT_TOKEN", ""),
+        os.environ.get("YT_COOKIES", ""),
+        os.environ.get("GITHUB_TOKEN", ""),
+        os.environ.get("GH_TOKEN", ""),
+    ]
+    for value in secret_values:
+        if value:
+            text = text.replace(value, "[secret]")
+    return TOKEN_LIKE_RE.sub("[secret]", text)
+
+
+def blank_state() -> dict:
+    return {"allowed_chat_ids": [], "jobs": {}, "last_update_id": 0}
+
+
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return blank_state()
+    try:
+        raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return blank_state()
+    if not isinstance(raw, dict):
+        return blank_state()
+    raw.setdefault("allowed_chat_ids", [])
+    raw.setdefault("jobs", {})
+    raw.setdefault("last_update_id", 0)
+    return raw
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def env_allowed() -> set[int]:
+    found: set[int] = set()
+    for part in os.environ.get("ALLOWED_CHAT_IDS", "").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            found.add(int(part))
+    return found
+
+
+def chat_allowed(state: dict, chat_id: int) -> bool:
+    allowed = env_allowed()
+    if allowed:
+        return chat_id in allowed
+    saved = [int(item) for item in state.get("allowed_chat_ids") or [] if str(item).lstrip("-").isdigit()]
+    if not saved:
+        return True
+    return chat_id in saved
+
+
+def remember_chat(state: dict, chat_id: int) -> None:
+    if env_allowed():
+        return
+    saved = state.setdefault("allowed_chat_ids", [])
+    if chat_id not in saved:
+        saved.append(chat_id)
+
+
+def git_run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=ROOT,
+        check=False,
+        text=True,
+        timeout=40,
+        capture_output=True,
+    )
+
+
+def merge_state(local: dict, remote: dict) -> dict:
+    allowed = []
+    for item in list(local.get("allowed_chat_ids") or []) + list(remote.get("allowed_chat_ids") or []):
+        if str(item).lstrip("-").isdigit() and int(item) not in allowed:
+            allowed.append(int(item))
+    jobs: dict = {}
+    keys = set((local.get("jobs") or {})) | set((remote.get("jobs") or {}))
+    for key in keys:
+        left = (local.get("jobs") or {}).get(key)
+        right = (remote.get("jobs") or {}).get(key)
+        if isinstance(left, dict) and not isinstance(right, dict):
+            jobs[key] = left
+        elif isinstance(right, dict) and not isinstance(left, dict):
+            jobs[key] = right
+        elif isinstance(left, dict) and isinstance(right, dict):
+            jobs[key] = left if float(left.get("updated") or 0) >= float(right.get("updated") or 0) else right
+    now = time.time()
+    kept = {}
+    for key, job in jobs.items():
+        updated = float(job.get("updated") or 0)
+        if job.get("status") in ACTIVE and now - updated < STALE_SECONDS:
+            kept[key] = job
+        elif now - updated < 3 * 24 * 60 * 60:
+            kept[key] = job
+    if len(kept) > 40:
+        ordered = sorted(kept.items(), key=lambda item: float(item[1].get("updated") or 0), reverse=True)
+        kept = dict(ordered[:40])
+    return {
+        "allowed_chat_ids": allowed,
+        "jobs": kept,
+        "last_update_id": max(int(local.get("last_update_id") or 0), int(remote.get("last_update_id") or 0)),
+    }
+
+
+def publish_state() -> None:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    local = load_state()
+    for _ in range(5):
+        fetched = git_run(["git", "fetch", "origin", "main"])
+        if fetched.returncode != 0:
+            print("state fetch failed")
+            return
+        remote_raw = git_run(["git", "show", "origin/main:state.json"])
+        if remote_raw.returncode == 0:
+            try:
+                remote = json.loads(remote_raw.stdout)
+            except json.JSONDecodeError:
+                remote = blank_state()
+            local = merge_state(local, remote if isinstance(remote, dict) else blank_state())
+        checkout = git_run(["git", "checkout", "-f", "-B", "main", "origin/main"])
+        if checkout.returncode != 0:
+            print("state checkout failed")
+            return
+        save_state(local)
+        git_run(["git", "add", "state.json"])
+        quiet = git_run(["git", "diff", "--cached", "--quiet", "state.json"])
+        if quiet.returncode == 0:
+            return
+        committed = git_run(["git", "commit", "-m", "Update bot state"])
+        if committed.returncode != 0:
+            print("state commit failed")
+            return
+        pushed = git_run(["git", "push", "origin", "HEAD:main"])
+        if pushed.returncode == 0:
+            return
+        local = load_state()
+    print("state publish failed")
+
+
+def api(token: str, method: str, payload: dict | None = None, timeout: int = 70) -> object:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        response = requests.post(url, json=payload or {}, timeout=timeout)
+    except requests.RequestException as exc:
+        raise TelegramError(method, scrub(exc.__class__.__name__), 0) from None
+    status = response.status_code
+    try:
+        body = response.json()
+    except ValueError:
+        if status in (401, 404):
+            raise FatalTokenError()
+        raise TelegramError(method, "bad response", status)
+    if status in (401, 404) or not isinstance(body, dict):
+        raise FatalTokenError()
+    if not body.get("ok"):
+        raise TelegramError(method, str(body.get("description") or "error"), status)
+    return body.get("result")
+
+
+def send_message(
+    token: str,
+    chat_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+) -> int | None:
+    payload: dict = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    result = api(token, "sendMessage", payload)
+    if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+        return result["message_id"]
+    return None
+
+
+def edit_message(
+    token: str,
+    chat_id: int,
+    message_id: object,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
+    if not isinstance(message_id, int):
+        return
+    payload: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:4000],
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
+    }
+    try:
+        api(token, "editMessageText", payload)
+    except TelegramError as exc:
+        if "not modified" in exc.description.lower():
+            return
+        print(f"edit failed status={exc.status}")
+
+
+def answer_callback(token: str, callback_id: str, text: str) -> None:
+    if not callback_id:
+        return
+    try:
+        api(
+            token,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_id, "text": text[:180]},
+        )
+    except FatalTokenError:
+        raise
+    except TelegramError:
+        print("answerCallbackQuery failed")
+
+
+def prepare_bot(token: str) -> None:
+    api(token, "deleteWebhook", {"drop_pending_updates": False})
+    try:
+        api(token, "setMyCommands", {"commands": COMMANDS})
+    except FatalTokenError:
+        raise
+    except TelegramError:
+        print("could not refresh the command menu")
+
+
+def clean_url(url: str) -> str:
+    return url.rstrip(").,،؛»\"'")
+
+
+def youtube_urls(text: str) -> list[str]:
+    return [clean_url(match.group(0)) for match in YOUTUBE_RE.finditer(text or "")]
+
+
+def video_id_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if host.endswith("youtu.be"):
+        part = parsed.path.strip("/").split("/")[0]
+        return part[:32]
+    query = urllib.parse.parse_qs(parsed.query)
+    if query.get("v") and query["v"][0]:
+        return query["v"][0][:32]
+    parts = [part for part in parsed.path.split("/") if part]
+    for key in ("shorts", "embed", "live", "v"):
+        if key in parts:
+            index = parts.index(key)
+            if index + 1 < len(parts):
+                return parts[index + 1][:32]
+    return ""
+
+
+def playlist_only(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    has_list = bool(query.get("list"))
+    return has_list and not video_id_from_url(url) or parsed.path.rstrip("/").endswith("/playlist")
+
+
+def format_duration(seconds: object) -> str:
+    if not isinstance(seconds, (int, float)) or seconds <= 0:
+        return "نامشخص"
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        text = f"{hours} ساعت و {minutes} دقیقه"
+    elif minutes:
+        text = f"{minutes} دقیقه و {secs} ثانیه"
+    else:
+        text = f"{secs} ثانیه"
+    return fa(text)
+
+
+def cookies_args() -> list[str]:
+    raw = os.environ.get("YT_COOKIES", "")
+    if not raw.strip():
+        return []
+    path = ROOT / "cookies.txt"
+    path.write_text(raw, encoding="utf-8", newline="\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return ["--cookies", str(path)]
+
+
+def clear_cookies() -> None:
+    path = ROOT / "cookies.txt"
+    if path.exists():
+        path.unlink()
+
+
+def probe(url: str) -> dict:
+    extra = ["--playlist-items", "1"] if playlist_only(url) else ["--no-playlist"]
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "-J",
+        "--no-warnings",
+        "--socket-timeout",
+        "30",
+        *extra,
+        *cookies_args(),
+        url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            timeout=150,
+            capture_output=True,
+        )
+    finally:
+        clear_cookies()
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    if completed.returncode != 0 or not stdout.strip():
+        print(scrub(stderr[-4000:]))
+        raise RuntimeError(classify_ytdlp(stderr) or "unknown")
+    try:
+        info = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("unknown") from exc
+    if isinstance(info, dict) and info.get("_type") == "playlist":
+        entries = [entry for entry in info.get("entries") or [] if isinstance(entry, dict)]
+        if not entries:
+            raise RuntimeError("unavailable")
+        info = entries[0]
+    if not isinstance(info, dict):
+        raise RuntimeError("unknown")
+    return info
+
+
+def classify_ytdlp(stderr: str) -> str:
+    text = (stderr or "").lower()
+    if "not a bot" in text or "sign in to confirm" in text:
+        return "bot"
+    if "private" in text:
+        return "private"
+    if "age" in text or "confirm your age" in text:
+        return "age"
+    if "removed" in text or "has been deleted" in text or "video unavailable" in text:
+        return "unavailable"
+    if "members-only" in text or "join this channel" in text:
+        return "private"
+    return ""
+
+
+def friendly_probe_error(kind: str) -> str:
+    if kind == "bot":
+        return "یوتیوب این بار اجازه نداد عزیزدلم، یه کم دیگه دوباره امتحان کن"
+    if kind == "private":
+        return "این ویدیو خصوصی یا محدود است قربونت برم، لینکش را ندارم"
+    if kind == "age":
+        return "این ویدیو محدودیت سنی دارد عزیزدلم. اگر کوکی یوتیوب را بگذاری، شاید دفعهٔ بعد بشود"
+    if kind == "unavailable":
+        return "این ویدیو پاک شده یا دیگر در دسترس نیست، نیایش جانم"
+    return "این بار نشد عشقم. لینک را یک کم بعد دوباره بفرست، من اینجام 💙"
+
+
+def choice_keyboard(video_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🎬 ۳۶۰", "callback_data": f"v:360:{video_id}"},
+                {"text": "🎬 ۷۲۰", "callback_data": f"v:720:{video_id}"},
+            ],
+            [
+                {"text": "🎬 ۱۰۸۰", "callback_data": f"v:1080:{video_id}"},
+                {"text": "🎬 بهترین", "callback_data": f"v:best:{video_id}"},
+            ],
+            [{"text": "🎵 فقط صدا", "callback_data": f"a:mp3:{video_id}"}],
+        ]
+    }
+
+
+def delivery_keyboard(video_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📉 کیفیت پایین‌تر", "callback_data": f"q:low:{video_id}"},
+                {"text": "🔗 لینک دانلود", "callback_data": f"q:link:{video_id}"},
+            ]
+        ]
+    }
+
+
+def job_key(chat_id: int, video_id: str) -> str:
+    return f"{chat_id}:{video_id}"
+
+
+def busy(state: dict, chat_id: int, ignore_key: str | None = None) -> bool:
+    now = time.time()
+    for key, job in (state.get("jobs") or {}).items():
+        if key == ignore_key or not isinstance(job, dict):
+            continue
+        if job.get("chat_id") != chat_id:
+            continue
+        if job.get("status") in ACTIVE and now - float(job.get("updated") or 0) < STALE_SECONDS:
+            return True
+    return False
+
+
+def put_job(state: dict, key: str, **fields: object) -> dict:
+    job = dict((state.setdefault("jobs", {})).get(key) or {})
+    job.update(fields)
+    job["updated"] = time.time()
+    state["jobs"][key] = job
+    return job
+
+
+def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
+    if busy(state, chat_id):
+        send_message(
+            token,
+            chat_id,
+            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
+        )
+        return
+    try:
+        info = probe(url)
+    except RuntimeError as exc:
+        send_message(token, chat_id, friendly_probe_error(str(exc)))
+        return
+    except Exception as exc:
+        print(scrub(f"{exc.__class__.__name__}: {exc}"))
+        send_message(token, chat_id, friendly_probe_error("unknown"))
+        return
+    if info.get("is_live"):
+        send_message(
+            token,
+            chat_id,
+            "این یکی پخش زنده است عزیزدلم. لینک ویدیوی ضبط‌شده را بفرست تا برات بگیرم 💙",
+        )
+        return
+    video_id = str(info.get("id") or video_id_from_url(url) or "")[:32]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
+        send_message(token, chat_id, friendly_probe_error("unknown"))
+        return
+    title = str(info.get("title") or "بدون عنوان").replace("\n", " ")[:300]
+    duration = info.get("duration")
+    key = job_key(chat_id, video_id)
+    note = ""
+    if isinstance(duration, (int, float)) and duration >= 2 * 60 * 60:
+        note = "\n\nاین یکی طولانی است نیایش جانم. محدودش نمی‌کنم؛ فقط ممکن است کمی بیشتر طول بکشد 💙"
+    text = (
+        f"نیایش جانم 💙\n{title}\n"
+        f"مدت: {format_duration(duration)}\n\n"
+        f"چطور برات بفرستم، عشقم؟{note}"
+    )
+    message_id = send_message(token, chat_id, text, choice_keyboard(video_id))
+    put_job(
+        state,
+        key,
+        chat_id=chat_id,
+        url=url,
+        video_id=video_id,
+        title=title,
+        duration=int(duration) if isinstance(duration, (int, float)) else 0,
+        status="choosing",
+        message_id=message_id or 0,
+    )
+
+
+def dispatch_download(job: dict, mode: str, quality: str) -> bool:
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not repo or not github_token:
+        print("dispatch unavailable")
+        return False
+    response = requests.post(
+        f"https://api.github.com/repos/{repo}/actions/workflows/download.yml/dispatches",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {github_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        json={
+            "ref": "main",
+            "inputs": {
+                "chat_id": str(job["chat_id"]),
+                "url": str(job["url"]),
+                "mode": mode,
+                "quality": quality,
+                "message_id": str(job.get("message_id") or 0),
+                "video_id": str(job["video_id"]),
+            },
+        },
+        timeout=30,
+    )
+    if response.status_code not in (200, 204):
+        print(f"dispatch failed status={response.status_code}")
+        return False
+    return True
+
+
+def begin_download(
+    token: str,
+    state: dict,
+    chat_id: int,
+    job: dict,
+    key: str,
+    mode: str,
+    quality: str,
+    ack: str,
+) -> None:
+    if busy(state, chat_id, ignore_key=key):
+        send_message(
+            token,
+            chat_id,
+            "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
+        )
+        return
+    message_id = job.get("message_id")
+    edit_message(token, chat_id, message_id, ack)
+    put_job(state, key, status="queued", mode=mode, quality=quality, message_id=message_id or 0)
+    if dispatch_download(state["jobs"][key], mode, quality):
+        return
+    put_job(state, key, status="error")
+    edit_message(
+        token,
+        chat_id,
+        message_id,
+        "این بار نشد عشقم. یک کم دیگر دوباره لینک را بفرست، من اینجام 💙",
+    )
+
+
+def lower_quality(quality: str) -> str | None:
+    order = ["best", "1080", "720", "360"]
+    if quality not in order:
+        return "360"
+    index = order.index(quality)
+    if index + 1 < len(order):
+        return order[index + 1]
+    return None
+
+
+def handle_callback(token: str, state: dict, callback: dict) -> None:
+    callback_id = str(callback.get("id") or "")
+    message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = chat.get("id")
+    data = callback.get("data") if isinstance(callback.get("data"), str) else ""
+    if chat.get("type") != "private" or not isinstance(chat_id, int):
+        answer_callback(token, callback_id, "")
+        return
+    if not chat_allowed(state, chat_id):
+        answer_callback(token, callback_id, "")
+        return
+    remember_chat(state, chat_id)
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        answer_callback(token, callback_id, "دوباره لینک را بفرست نیایش جانم")
+        return
+    kind, choice, video_id = parts
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
+        answer_callback(token, callback_id, "دوباره لینک را بفرست نیایش جانم")
+        return
+    key = job_key(chat_id, video_id)
+    job = (state.get("jobs") or {}).get(key)
+    if not isinstance(job, dict) or job.get("chat_id") != chat_id or not job.get("url"):
+        answer_callback(token, callback_id, "لینک را یک بار دیگر بفرست نیایش جانم")
+        return
+    if isinstance(message.get("message_id"), int):
+        job["message_id"] = message["message_id"]
+    if kind == "v" and choice in {"360", "720", "1080", "best"}:
+        answer_callback(token, callback_id, "چشم نیایش جانم")
+        begin_download(
+            token,
+            state,
+            chat_id,
+            job,
+            key,
+            "video",
+            choice,
+            "چشم نیایش جانم، دارم برات می‌گیرمش 💙 چند دقیقه صبر کن",
+        )
+        return
+    if kind == "a" and choice == "mp3":
+        answer_callback(token, callback_id, "چشم عشقم")
+        begin_download(
+            token,
+            state,
+            chat_id,
+            job,
+            key,
+            "audio",
+            "audio",
+            "چشم عشقم، دارم صداش را برات جدا می‌کنم 💙 چند دقیقه صبر کن",
+        )
+        return
+    if kind == "q" and choice == "low":
+        answer_callback(token, callback_id, "کیفیت را پایین‌تر می‌آورم")
+        shrink_mode = "shrink-audio" if job.get("mode") == "audio" else "shrink"
+        begin_download(
+            token,
+            state,
+            chat_id,
+            job,
+            key,
+            shrink_mode,
+            "audio" if shrink_mode == "shrink-audio" else str(job.get("quality") or "best"),
+            "چشم قربونت برم، کیفیت را پایین می‌آورم تا بتواند برایت بیاید 💙",
+        )
+        return
+    if kind == "q" and choice == "link":
+        answer_callback(token, callback_id, "لینک را آماده می‌کنم")
+        begin_download(
+            token,
+            state,
+            chat_id,
+            job,
+            key,
+            "release",
+            str(job.get("quality") or "best"),
+            "چشم عزیزدلم، دارم لینک دانلود را برات آماده می‌کنم 💙",
+        )
+        return
+    answer_callback(token, callback_id, "این دکمه دیگر تازه نیست")
+
+
+def handle_message(token: str, state: dict, message: dict) -> None:
+    if message.get("from", {}).get("is_bot"):
+        return
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    chat_id = chat.get("id")
+    if chat.get("type") != "private" or not isinstance(chat_id, int):
+        return
+    if not chat_allowed(state, chat_id):
+        return
+    remember_chat(state, chat_id)
+    text = message.get("text") if isinstance(message.get("text"), str) else ""
+    stripped = text.strip()
+    if not stripped:
+        send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را برام بفرست 💙")
+        return
+    command = stripped.split()[0].split("@")[0].lower()
+    if command in {"/start", "/help"} or stripped in {"سلام", "سلم"}:
+        if command == "/help":
+            send_message(
+                token,
+                chat_id,
+                "نیایش جانم، لینک یوتیوب را بفرست.\n"
+                "بعدش دکمه‌ها را نشانت می‌دهم: ویدیو با کیفیت‌های مختلف، یا فقط صدا.\n"
+                "هر کدام را بخواهی، چشم عشقم 💙",
+            )
+            return
+        send_message(
+            token,
+            chat_id,
+            "سلام نیایش جانم 💙\n"
+            "لینک یوتیوب رو برام بفرست.\n"
+            "بعدش خودم می‌پرسم ویدیو باشه یا فقط صدا، و با چه کیفیتی.\n"
+            "قربونت برم.",
+        )
+        return
+    urls = youtube_urls(stripped)
+    if urls:
+        offer_video(token, state, chat_id, urls[0])
+        return
+    if "http://" in stripped or "https://" in stripped:
+        send_message(token, chat_id, "عزیزدلم، من فقط لینک یوتیوب را می‌توانم برات بگیرم 💙")
+        return
+    send_message(token, chat_id, "نیایش جانم، لینک یوتیوب را بفرست تا بپرسم چطور می‌خواهی 💙")
+
+
+def pull_updates(token: str, offset: int, timeout: int) -> list[dict]:
+    result = api(
+        token,
+        "getUpdates",
+        {
+            "allowed_updates": ["message", "callback_query"],
+            "offset": offset,
+            "timeout": timeout,
+        },
+        timeout=timeout + 20,
+    )
+    if not isinstance(result, list):
+        return []
+    return [item for item in result if isinstance(item, dict)]
+
+
+def process_updates(token: str, state: dict, poll_timeout: int) -> int:
+    try:
+        updates = pull_updates(token, int(state.get("last_update_id") or 0) + 1, poll_timeout)
+    except FatalTokenError:
+        raise
+    except TelegramError as exc:
+        if exc.status == 409:
+            raise
+        print(f"could not read updates status={exc.status}")
+        return 0
+    handled = 0
+    for update in updates:
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int):
+            continue
+        try:
+            if isinstance(update.get("callback_query"), dict):
+                handle_callback(token, state, update["callback_query"])
+            elif isinstance(update.get("message"), dict):
+                handle_message(token, state, update["message"])
+        except FatalTokenError:
+            raise
+        except TelegramError as exc:
+            print(f"update failed status={exc.status}")
+        except Exception as exc:
+            print(scrub(f"update failed {exc.__class__.__name__}: {exc}"))
+        state["last_update_id"] = update_id
+        handled += 1
+    return handled
+
+
+def run_once(token: str, poll_timeout: int = 0, prepare: bool = True) -> int:
+    state = load_state()
+    before = json.dumps(state, ensure_ascii=False, sort_keys=True)
+    try:
+        if prepare:
+            prepare_bot(token)
+        handled = process_updates(token, state, poll_timeout)
+    except FatalTokenError:
+        print("BOT_TOKEN was rejected by Telegram.", file=sys.stderr)
+        return 1
+    except TelegramError as exc:
+        if exc.status == 409:
+            print("another instance is polling; skip")
+            time.sleep(15)
+            return 0
+        raise
+    after = json.dumps(state, ensure_ascii=False, sort_keys=True)
+    if after != before:
+        save_state(state)
+        publish_state()
+    print(f"done updates={handled}", flush=True)
+    return 0
+
+
+def load_token() -> str:
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if token:
+        return token
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return ""
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith("BOT_TOKEN="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def self_check() -> None:
+    sample = "ببین https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123."
+    urls = youtube_urls(sample)
+    assert urls == ["https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123"]
+    assert video_id_from_url(urls[0]) == "dQw4w9WgXcQ"
+    assert video_id_from_url("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert video_id_from_url("https://m.youtube.com/shorts/abcdefghijk") == "abcdefghijk"
+    assert playlist_only("https://www.youtube.com/playlist?list=PL123")
+    assert not playlist_only(urls[0])
+    assert format_duration(3661).startswith("۱")
+    fresh = time.time()
+    merged = merge_state(
+        {"allowed_chat_ids": [1], "jobs": {"a": {"updated": fresh, "status": "done"}}, "last_update_id": 5},
+        {"allowed_chat_ids": [2], "jobs": {"a": {"updated": fresh + 1, "status": "running"}}, "last_update_id": 4},
+    )
+    assert merged["last_update_id"] == 5
+    assert merged["jobs"]["a"]["status"] == "running"
+    assert merged["allowed_chat_ids"] == [1, 2]
+    assert lower_quality("best") == "1080"
+    assert lower_quality("360") is None
+    print("check ok")
+
+
+def main() -> None:
+    if "--check" in sys.argv:
+        self_check()
+        return
+    token = load_token()
+    if not token:
+        print("BOT_TOKEN is not set.", file=sys.stderr)
+        sys.exit(1)
+    if "--watch" in sys.argv:
+        limit = int(os.environ.get("WATCH_SECONDS", "0") or "0")
+        deadline = time.time() + limit if limit else None
+        print("watching", flush=True)
+        prepare_bot(token)
+        while deadline is None or time.time() < deadline:
+            try:
+                run_once(token, poll_timeout=50, prepare=False)
+            except FatalTokenError:
+                print("BOT_TOKEN was rejected by Telegram.", file=sys.stderr)
+                sys.exit(1)
+            except Exception as exc:
+                print(scrub(f"{exc.__class__.__name__}: {exc}"), file=sys.stderr)
+                time.sleep(3)
+        print("watch shift ended", flush=True)
+        return
+    sys.exit(run_once(token))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(scrub(f"{exc.__class__.__name__}: {exc}"), file=sys.stderr)
+        sys.exit(1)
