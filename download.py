@@ -44,7 +44,8 @@ def video_format(quality: str) -> str:
     floor = {"720": "480", "1080": "720"}.get(height)
     tall = f"[height>={floor}]" if floor else ""
     return (
-        f"b[height<={height}]{tall}[ext=mp4][protocol=https]/"
+        f"bv*[height<={height}]{tall}[ext=mp4][vcodec^=avc1][protocol=https]+ba[ext=m4a][protocol=https]/"
+        f"b[height<={height}]{tall}[ext=mp4][vcodec^=avc1][protocol=https]/"
         f"bv*[height<={height}]{tall}[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
         f"b[height<={height}][ext=mp4][protocol=https]/"
         f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
