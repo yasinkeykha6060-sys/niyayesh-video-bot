@@ -372,26 +372,21 @@ def progress_text(percent: float, line: str) -> str:
     return f"{line}\n{filling_bar(shown)}  {fa(str(shown))}٪"
 
 
-def ytdlp_base(url: str, clients: str = "mweb,android_vr,web_embedded,tv") -> list[str]:
+def ytdlp_base(url: str, clients: str = "android_vr") -> list[str]:
     playlist = ["--playlist-items", "1"] if playlist_only(url) else ["--no-playlist"]
     return [
         sys.executable,
         "-m",
         "yt_dlp",
         "--no-warnings",
-        "--no-js-runtimes",
-        "--js-runtimes",
-        "deno",
-        "--js-runtimes",
-        "node",
-        "--remote-components",
-        "ejs:github",
         "--extractor-args",
         f"youtube:player_client={clients}",
         "--socket-timeout",
         "30",
         "--retries",
-        "2",
+        "3",
+        "--fragment-retries",
+        "5",
         *playlist,
         *cookies_args(),
     ]
