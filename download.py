@@ -38,11 +38,7 @@ def video_format(quality: str) -> str:
     # A single https file first. Split streams are only the backup, so the bar
     # is the whole video and YouTube's tiny pieces are not used.
     if quality == "best":
-        return (
-            "bv*[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
-            "bv*[height>=720][ext=mp4]+ba[ext=m4a]/"
-            "b[ext=mp4][protocol=https]/b"
-        )
+        return video_format("1080")
     height = quality if quality in {"360", "720", "1080"} else "720"
     floor = {"720": "480", "1080": "720"}.get(height)
     tall = f"[height>={floor}]" if floor else ""
