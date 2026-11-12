@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -331,6 +332,46 @@ def format_duration(seconds: object) -> str:
     return fa(text)
 
 
+def filling_bar(percent: float, width: int = 12) -> str:
+    bounded = max(0.0, min(100.0, float(percent)))
+    filled = int(round(bounded / 100 * width))
+    if bounded > 0 and filled == 0:
+        filled = 1
+    if bounded < 100 and filled == width:
+        filled = width - 1
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def progress_text(percent: float, line: str) -> str:
+    shown = int(round(max(0.0, min(100.0, float(percent)))))
+    return f"{line}\n{filling_bar(shown)}  {fa(str(shown))}٪"
+
+
+def ytdlp_base(url: str, clients: str = "mweb,android_vr,web_embedded,tv") -> list[str]:
+    playlist = ["--playlist-items", "1"] if playlist_only(url) else ["--no-playlist"]
+    return [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--no-warnings",
+        "--no-js-runtimes",
+        "--js-runtimes",
+        "deno",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "--extractor-args",
+        f"youtube:player_client={clients}",
+        "--socket-timeout",
+        "30",
+        "--retries",
+        "2",
+        *playlist,
+        *cookies_args(),
+    ]
+
+
 def cookies_args() -> list[str]:
     raw = os.environ.get("YT_COOKIES", "")
     if not raw.strip():
@@ -350,52 +391,53 @@ def clear_cookies() -> None:
         path.unlink()
 
 
-def probe(url: str) -> dict:
-    extra = ["--playlist-items", "1"] if playlist_only(url) else ["--no-playlist"]
-    command = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "-J",
-        "--no-warnings",
-        "--socket-timeout",
-        "30",
-        *extra,
-        *cookies_args(),
-        url,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=ROOT,
-            check=False,
-            text=True,
-            timeout=150,
-            capture_output=True,
-        )
-    finally:
-        clear_cookies()
-    stdout = completed.stdout or ""
-    stderr = completed.stderr or ""
-    if completed.returncode != 0 or not stdout.strip():
-        print(scrub(stderr[-4000:]))
-        raise RuntimeError(classify_ytdlp(stderr) or "unknown")
-    try:
-        info = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("unknown") from exc
+def read_info(stdout: str) -> dict:
+    info = json.loads(stdout)
     if isinstance(info, dict) and info.get("_type") == "playlist":
         entries = [entry for entry in info.get("entries") or [] if isinstance(entry, dict)]
         if not entries:
             raise RuntimeError("unavailable")
         info = entries[0]
-    if not isinstance(info, dict):
+    if not isinstance(info, dict) or not info.get("id"):
         raise RuntimeError("unknown")
     return info
 
 
+def probe(url: str) -> dict:
+    last_kind = "unknown"
+    for clients in ("mweb,android_vr,web_embedded,tv", "android_vr", "web_safari,tv"):
+        command = [*ytdlp_base(url, clients), "-J", "--retries", "1", url]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=False,
+                text=True,
+                timeout=75,
+                capture_output=True,
+            )
+        finally:
+            clear_cookies()
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if completed.returncode == 0 and stdout.strip():
+            try:
+                return read_info(stdout)
+            except (json.JSONDecodeError, RuntimeError) as exc:
+                last_kind = str(exc) if isinstance(exc, RuntimeError) else "unknown"
+                print(scrub(stderr[-2000:]))
+                continue
+        print(scrub(stderr[-2000:]))
+        last_kind = classify_ytdlp(stderr) or "unknown"
+        if last_kind in {"private", "age", "unavailable"}:
+            raise RuntimeError(last_kind)
+    raise RuntimeError(last_kind)
+
+
 def classify_ytdlp(stderr: str) -> str:
     text = (stderr or "").lower()
+    if "confirm your age" in text or "age-restricted" in text or "age restricted" in text:
+        return "age"
     if "not a bot" in text or "sign in to confirm" in text:
         return "bot"
     if "private" in text:
@@ -480,25 +522,61 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
             "نیایش جانم، هنوز یکی را دارم برات می‌گیرم. تموم که شد دوباره بفرست، عشقم 💙",
         )
         return
+    status_id = send_message(
+        token,
+        chat_id,
+        progress_text(6, "دارم از یوتیوب می‌پرسم نیایش جانم 💙"),
+    )
+    stop = threading.Event()
+
+    def tick() -> None:
+        percent = 6.0
+        while not stop.is_set():
+            if stop.wait(2.5):
+                return
+            percent = min(88.0, percent + 7)
+            edit_message(
+                token,
+                chat_id,
+                status_id,
+                progress_text(percent, "دارم از یوتیوب می‌پرسم نیایش جانم 💙"),
+            )
+
+    worker = threading.Thread(target=tick, daemon=True)
+    worker.start()
+    info = None
+    error_kind = ""
     try:
         info = probe(url)
     except RuntimeError as exc:
-        send_message(token, chat_id, friendly_probe_error(str(exc)))
-        return
+        error_kind = str(exc)
     except Exception as exc:
         print(scrub(f"{exc.__class__.__name__}: {exc}"))
-        send_message(token, chat_id, friendly_probe_error("unknown"))
+        error_kind = "unknown"
+    finally:
+        stop.set()
+        worker.join(4)
+    if error_kind or info is None:
+        show = friendly_probe_error(error_kind or "unknown")
+        if status_id:
+            edit_message(token, chat_id, status_id, show)
+        else:
+            send_message(token, chat_id, show)
         return
     if info.get("is_live"):
-        send_message(
-            token,
-            chat_id,
-            "این یکی پخش زنده است عزیزدلم. لینک ویدیوی ضبط‌شده را بفرست تا برات بگیرم 💙",
-        )
+        live = "این یکی پخش زنده است عزیزدلم. لینک ویدیوی ضبط‌شده را بفرست تا برات بگیرم 💙"
+        if status_id:
+            edit_message(token, chat_id, status_id, live)
+        else:
+            send_message(token, chat_id, live)
         return
     video_id = str(info.get("id") or video_id_from_url(url) or "")[:32]
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
-        send_message(token, chat_id, friendly_probe_error("unknown"))
+        show = friendly_probe_error("unknown")
+        if status_id:
+            edit_message(token, chat_id, status_id, show)
+        else:
+            send_message(token, chat_id, show)
         return
     title = str(info.get("title") or "بدون عنوان").replace("\n", " ")[:300]
     duration = info.get("duration")
@@ -511,7 +589,11 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
         f"مدت: {format_duration(duration)}\n\n"
         f"چطور برات بفرستم، عشقم؟{note}"
     )
-    message_id = send_message(token, chat_id, text, choice_keyboard(video_id))
+    if status_id:
+        edit_message(token, chat_id, status_id, text, choice_keyboard(video_id))
+        message_id = status_id
+    else:
+        message_id = send_message(token, chat_id, text, choice_keyboard(video_id))
     put_job(
         state,
         key,
@@ -575,7 +657,7 @@ def begin_download(
         )
         return
     message_id = job.get("message_id")
-    edit_message(token, chat_id, message_id, ack)
+    edit_message(token, chat_id, message_id, progress_text(0, ack))
     put_job(state, key, status="queued", mode=mode, quality=quality, message_id=message_id or 0)
     if dispatch_download(state["jobs"][key], mode, quality):
         return
@@ -829,6 +911,11 @@ def self_check() -> None:
     assert merged["last_update_id"] == 5
     assert merged["jobs"]["a"]["status"] == "running"
     assert merged["allowed_chat_ids"] == [1, 2]
+    assert filling_bar(0) == "▱" * 12
+    assert filling_bar(100) == "▰" * 12
+    assert filling_bar(50).count("▰") == 6
+    assert classify_ytdlp("Sign in to confirm your age") == "age"
+    assert classify_ytdlp("Sign in to confirm you're not a bot") == "bot"
     assert lower_quality("best") == "1080"
     assert lower_quality("360") is None
     print("check ok")

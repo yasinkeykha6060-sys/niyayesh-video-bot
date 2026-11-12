@@ -48,11 +48,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install ffmpeg and yt-dlp
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          python -m pip install -U requests yt-dlp
+          python -m pip install -U -r requirements.txt
+
+      - name: Start YouTube token helper
+        run: docker run -d --name bgutil --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider || echo "pot server unavailable"
 
       - name: Download and send
         env:

@@ -27,13 +27,22 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install dependencies
         run: python -m pip install -U -r requirements.txt
+
+      - name: Start YouTube token helper
+        run: docker run -d --name bgutil --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider || echo "pot server unavailable"
 
       - name: Listen
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
           GITHUB_TOKEN: ${{ github.token }}
           PYTHONUNBUFFERED: "1"
           WATCH_SECONDS: "17400"

@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -71,38 +73,84 @@ def newest_media(folder: Path) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+
+
+class Bar:
+    def __init__(self, token: str, chat_id: int, message_id: object):
+        self.token = token
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.last_at = 0.0
+        self.last_pct = -1.0
+        self.stage = 1
+
+    def __call__(self, percent: float) -> None:
+        if percent + 15 < self.last_pct:
+            self.stage += 1
+        now = time.time()
+        if percent < 99 and now - self.last_at < 4 and abs(percent - self.last_pct) < 4:
+            return
+        self.last_at = now
+        self.last_pct = percent
+        line = "نیایش جانم، دارم برات می‌گیرمش 💙"
+        if self.stage > 1:
+            line = f"نیایش جانم، بخش {bot.fa(str(self.stage))} را هم می‌گیرم 💙"
+        bot.edit_message(self.token, self.chat_id, self.message_id, bot.progress_text(percent, line))
+
+
+_reporter: Bar | None = None
+
+
 def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
     print("yt-dlp start", flush=True)
+    proc = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    kept: list[str] = []
+
+    def read() -> None:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            match = PROGRESS_RE.search(line)
+            if match and _reporter is not None:
+                try:
+                    _reporter(float(match.group(1)))
+                except Exception:
+                    print("progress update failed")
+                continue
+            kept.append(line)
+            if line.strip():
+                print(bot.scrub(line.rstrip())[:300], flush=True)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
     try:
-        return subprocess.run(
-            command,
-            cwd=ROOT,
-            check=False,
-            text=True,
-            timeout=5 * 60 * 60,
-            capture_output=True,
-        )
-    finally:
-        bot.clear_cookies()
+        code = proc.wait(timeout=5 * 60 * 60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        code = 1
+    reader.join(5)
+    bot.clear_cookies()
+    detail = "".join(kept)[-4000:]
+    return subprocess.CompletedProcess(command, code, detail, detail)
 
 
 def base_command(url: str, folder: Path) -> list[str]:
-    extra = ["--playlist-items", "1"] if bot.playlist_only(url) else ["--no-playlist"]
     return [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--no-warnings",
-        "--retries",
-        "3",
+        *bot.ytdlp_base(url),
+        "--newline",
+        "--progress",
         "--fragment-retries",
-        "3",
-        "--socket-timeout",
-        "30",
+        "5",
         "-o",
         str(folder / "%(id)s.%(ext)s"),
-        *extra,
-        *bot.cookies_args(),
     ]
 
 
@@ -345,9 +393,14 @@ def send_or_offer(
 ) -> None:
     size = path.stat().st_size
     if size <= TELEGRAM_LIMIT:
-        bot.edit_message(token, chat_id, message_id, "گرفتمش عزیزدلم، دارم می‌فرستمش برات 💙")
+        bot.edit_message(
+            token,
+            chat_id,
+            message_id,
+            bot.progress_text(100, "گرفتمش عزیزدلم، دارم می‌فرستمش برات 💙"),
+        )
         send_media(token, chat_id, path, kind, title)
-        bot.edit_message(token, chat_id, message_id, "رسید نیایش جانم 💙")
+        bot.edit_message(token, chat_id, message_id, bot.progress_text(100, "رسید نیایش جانم 💙"))
         mark(key, status="done", quality=quality)
         return
     if size <= RELEASE_LIMIT:
@@ -506,7 +559,9 @@ def run() -> None:
     key = bot.job_key(chat_id, video_id)
     folder = work_dir(video_id)
     mark(key, status="running", mode=mode, quality=quality, chat_id=chat_id, url=url, video_id=video_id)
-    bot.edit_message(token, chat_id, message_id, "دارم دانلودش می‌کنم نیایش جانم 💙")
+    global _reporter
+    _reporter = Bar(token, chat_id, message_id)
+    bot.edit_message(token, chat_id, message_id, bot.progress_text(0, "دارم دانلودش می‌کنم نیایش جانم 💙"))
     title = video_id
     duration = 0
     try:
@@ -610,6 +665,7 @@ def run() -> None:
     finally:
         shutil.rmtree(folder, ignore_errors=True)
         bot.clear_cookies()
+        _reporter = None
 
 
 if __name__ == "__main__":
