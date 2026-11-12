@@ -602,7 +602,7 @@ def split_media(path: Path, depth: int = 0) -> list[Path]:
         return []
     size = path.stat().st_size
     length = max(media_duration(path, 0), 1)
-    seconds = max(12.0, (PART_BYTES / size) * length * 0.75)
+    seconds = max(4.0, (PART_BYTES / size) * length * 0.75)
     dest_dir = path.parent / f"parts-{path.stem}-{depth}"
     dest_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(dest_dir / f"p%03d{path.suffix}")
