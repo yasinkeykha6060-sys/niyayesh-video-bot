@@ -77,26 +77,55 @@ PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 
 
 class Bar:
-    def __init__(self, token: str, chat_id: int, message_id: object):
+    def __init__(self, token: str, chat_id: int, message_id: object, line: str, url: str):
         self.token = token
         self.chat_id = chat_id
         self.message_id = message_id
+        self.line = line
+        self.url = url
         self.last_at = 0.0
         self.last_pct = -1.0
         self.stage = 1
+        self._real = False
+        self._floor = 8.0
+        threading.Thread(target=self._creep, daemon=True).start()
+
+    def _show(self, percent: float, line: str) -> None:
+        bot.edit_message(
+            self.token,
+            self.chat_id,
+            self.message_id,
+            bot.progress_text(percent, line, self.url),
+            preview=bool(self.url),
+        )
+
+    def _creep(self) -> None:
+        percent = 8.0
+        while not self._real and percent < 36:
+            time.sleep(2.2)
+            if self._real:
+                return
+            percent = min(36.0, percent + 4)
+            self._floor = percent
+            try:
+                self._show(percent, self.line)
+            except Exception:
+                print("progress update failed")
 
     def __call__(self, percent: float) -> None:
+        self._real = True
         if percent + 15 < self.last_pct:
             self.stage += 1
+        shown = 100.0 if percent >= 99 else max(self._floor, percent)
         now = time.time()
-        if percent < 99 and now - self.last_at < 4 and abs(percent - self.last_pct) < 4:
+        if shown < 99 and now - self.last_at < 4 and abs(shown - self.last_pct) < 4:
             return
         self.last_at = now
-        self.last_pct = percent
-        line = "نیایش جانم، دارم برات می‌گیرمش 💙"
+        self.last_pct = shown
+        line = self.line
         if self.stage > 1:
             line = f"نیایش جانم، بخش {bot.fa(str(self.stage))} را هم می‌گیرم 💙"
-        bot.edit_message(self.token, self.chat_id, self.message_id, bot.progress_text(percent, line))
+        self._show(shown, line)
 
 
 _reporter: Bar | None = None
@@ -142,9 +171,9 @@ def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(command, code, detail, detail)
 
 
-def base_command(url: str, folder: Path, proxy: str = "") -> list[str]:
+def base_command(url: str, folder: Path, proxy: str = "", clients: str = "") -> list[str]:
     command = [
-        *bot.ytdlp_base(url),
+        *bot.ytdlp_base(url, clients),
         "--newline",
         "--progress",
         "--fragment-retries",
@@ -155,6 +184,53 @@ def base_command(url: str, folder: Path, proxy: str = "") -> list[str]:
     if proxy:
         command.extend(["--proxy", proxy])
     return command
+
+
+def _routes() -> list[str]:
+    proxy = os.environ.get("YT_PROXY", "").strip()
+    if proxy:
+        return [proxy]
+    return [""]
+
+
+def _clear_partials(folder: Path) -> None:
+    if not folder.exists():
+        return
+    for path in folder.rglob("*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _client_order(kind: str, quality: str) -> tuple[str, ...]:
+    if kind == "audio" or quality in {"720", "1080", "best"}:
+        return ("", "tv", "web_embedded,android", "android")
+    return ("web_embedded,android", "", "android", "tv")
+
+
+def _attempt(kind: str, url: str, folder: Path, quality: str, duration: int) -> tuple[Path | None, str]:
+    last = "unknown"
+    saw_age = False
+    for clients in _client_order(kind, quality):
+        for route in _routes():
+            label = clients or "default"
+            print(f"try {kind} client={label} proxy={'yes' if route else 'no'}", flush=True)
+            _clear_partials(folder)
+            if kind == "audio":
+                path, error = _ytdlp_audio(url, folder, duration, route, clients)
+            else:
+                path, error = _ytdlp_video(url, folder, quality, route, clients)
+            if path is not None:
+                return path, ""
+            if error in {"private", "unavailable"}:
+                return None, error
+            if error == "age":
+                saw_age = True
+                continue
+            if error:
+                last = error
+    if saw_age and last == "unknown":
+        return None, "age"
+    return None, last
 
 
 def save_stream(file_url: str, dest: Path) -> Path | None:
@@ -246,24 +322,20 @@ def cobalt_download(url: str, folder: Path, video_id: str, mode: str, quality: s
 
 
 def download_video(url: str, folder: Path, quality: str) -> tuple[Path | None, str]:
-    path, error = _ytdlp_video(url, folder, quality, "")
+    path, error = _attempt("video", url, folder, quality, 0)
     if path is not None:
         return path, ""
-    proxy = os.environ.get("YT_PROXY", "").strip()
-    if proxy:
-        print("retry on backup network")
-        path, error = _ytdlp_video(url, folder, quality, proxy)
-        if path is not None:
-            return path, ""
+    if error in {"private", "unavailable"}:
+        return None, error
     saved = cobalt_download(url, folder, bot.stable_id(url), "video", quality)
     if saved is not None:
         return saved, ""
     return None, error or "unknown"
 
 
-def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str) -> tuple[Path | None, str]:
+def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str, clients: str = "") -> tuple[Path | None, str]:
     command = [
-        *base_command(url, folder, proxy),
+        *base_command(url, folder, proxy, clients),
         "-f",
         video_format(quality),
         "--merge-output-format",
@@ -278,27 +350,23 @@ def _ytdlp_video(url: str, folder: Path, quality: str, proxy: str) -> tuple[Path
 
 
 def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | None, str]:
-    path, error = _ytdlp_audio(url, folder, duration, "")
+    path, error = _attempt("audio", url, folder, "audio", duration)
     if path is not None:
         return path, ""
-    proxy = os.environ.get("YT_PROXY", "").strip()
-    if proxy:
-        print("retry audio on backup network")
-        path, error = _ytdlp_audio(url, folder, duration, proxy)
-        if path is not None:
-            return path, ""
+    if error in {"private", "unavailable"}:
+        return None, error
     saved = cobalt_download(url, folder, bot.stable_id(url), "audio", "audio")
     if saved is not None:
         return saved, ""
     return None, error or "unknown"
 
 
-def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str) -> tuple[Path | None, str]:
+def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str, clients: str = "") -> tuple[Path | None, str]:
     selector = "bestaudio/best"
     if duration >= 3 * 60 * 60:
         selector = "bestaudio[abr<=48]/worstaudio/bestaudio"
     command = [
-        *base_command(url, folder, proxy),
+        *base_command(url, folder, proxy, clients),
         "-x",
         "--audio-format",
         "mp3",
@@ -497,9 +565,10 @@ def impossible_message(token: str, chat_id: int, message_id: object) -> None:
 
 
 def mark(key: str, **fields: object) -> None:
-    state = bot.load_state()
-    bot.put_job(state, key, **fields)
-    bot.save_state(state)
+    with bot.STATE_LOCK:
+        state = bot.load_state()
+        bot.put_job(state, key, **fields)
+        bot.save_state(state)
     bot.publish_state()
 
 
@@ -543,7 +612,7 @@ def download_requested(
 ) -> tuple[Path | None, str, str]:
     if mode == "audio":
         path, error = download_audio(url, folder, duration)
-        if path is None and error not in {"bot", "private", "age", "unavailable"}:
+        if path is None and error not in {"bot", "private", "age", "unavailable", "forbidden"}:
             path, error = download_audio(url, folder, duration)
         return path, "audio", error
     current = quality if quality in QUALITY_ORDER else "best"
@@ -559,7 +628,7 @@ def download_requested(
         path, error = download_video(url, folder, current)
         if path is not None:
             return ensure_mp4(path), "video", ""
-        if error in {"bot", "private", "age", "unavailable"}:
+        if error in {"bot", "private", "age", "unavailable", "forbidden"}:
             return None, "video", error
         attempts += 1
         nxt = step_down(current)
@@ -587,7 +656,7 @@ def shrink(url: str, folder: Path, quality: str, duration: int) -> tuple[Path | 
             continue
         reset_folder(folder)
         path, error = download_video(url, folder, current)
-        if error in {"bot", "private", "age", "unavailable"}:
+        if error in {"bot", "private", "age", "unavailable", "forbidden"}:
             return None, error
         if path is None:
             nxt = step_down(current)
@@ -638,7 +707,7 @@ def release_file(
             continue
         reset_folder(folder)
         path, error = download_video(url, folder, current)
-        if error in {"bot", "private", "age", "unavailable"}:
+        if error in {"bot", "private", "age", "unavailable", "forbidden"}:
             return None, "video", error
         if path is None:
             nxt = step_down(current)
@@ -661,30 +730,50 @@ def finish_error(token: str, chat_id: int, message_id: object, key: str, kind: s
     bot.edit_message(token, chat_id, message_id, bot.friendly_probe_error(kind))
 
 
-def run() -> None:
+def run(
+    chat_id: int | None = None,
+    url: str | None = None,
+    mode: str | None = None,
+    quality: str | None = None,
+    video_id: str | None = None,
+    message_id: int | None = None,
+    status_line: str = "",
+) -> None:
     token = bot.load_token()
     if not token:
         print("BOT_TOKEN is not set.", file=sys.stderr)
         sys.exit(1)
-    chat_raw = os.environ.get("CHAT_ID", "").strip()
-    url = os.environ.get("VIDEO_URL", "").strip()
-    mode = os.environ.get("MODE", "").strip()
-    quality = os.environ.get("QUALITY", "").strip() or "best"
-    video_id = os.environ.get("VIDEO_ID", "").strip()
-    message_raw = os.environ.get("MESSAGE_ID", "").strip()
-    if not chat_raw.lstrip("-").isdigit() or not bot.youtube_urls(url):
+    if chat_id is None:
+        chat_raw = os.environ.get("CHAT_ID", "").strip()
+        if not chat_raw.lstrip("-").isdigit():
+            print("bad download request")
+            sys.exit(1)
+        chat_id = int(chat_raw)
+    if url is None:
+        url = os.environ.get("VIDEO_URL", "")
+    url = url.strip()
+    if mode is None:
+        mode = os.environ.get("MODE", "")
+    mode = mode.strip()
+    if quality is None:
+        quality = os.environ.get("QUALITY", "")
+    quality = quality.strip() or "best"
+    if video_id is None:
+        video_id = os.environ.get("VIDEO_ID", "").strip()
+    if message_id is None:
+        message_raw = os.environ.get("MESSAGE_ID", "").strip()
+        message_id = int(message_raw) if message_raw.lstrip("-").isdigit() else 0
+    if not bot.youtube_urls(url):
         print("bad download request")
         sys.exit(1)
-    chat_id = int(chat_raw)
-    message_id = int(message_raw) if message_raw.lstrip("-").isdigit() else 0
     if not video_id:
         video_id = bot.video_id_from_url(url)
     key = bot.job_key(chat_id, video_id)
     folder = work_dir(video_id)
     mark(key, status="running", mode=mode, quality=quality, chat_id=chat_id, url=url, video_id=video_id)
     global _reporter
-    _reporter = Bar(token, chat_id, message_id)
-    bot.edit_message(token, chat_id, message_id, bot.progress_text(0, "دارم دانلودش می‌کنم نیایش جانم 💙"))
+    line = status_line or "چشم نیایش جانم، دارم برات می‌گیرمش 💙 چند دقیقه صبر کن"
+    _reporter = Bar(token, chat_id, message_id, line, url)
     title = bot.public_title(url) or video_id
     duration = 0
     try:

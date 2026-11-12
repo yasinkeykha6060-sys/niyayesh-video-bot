@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ COMMANDS = [
     {"command": "start", "description": "سلام و طرز کار"},
     {"command": "help", "description": "راهنمای کوتاه"},
 ]
+STATE_LOCK = threading.RLock()
 
 
 class FatalTokenError(Exception):
@@ -167,6 +169,11 @@ def merge_state(local: dict, remote: dict) -> dict:
 def publish_state() -> None:
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
+    with STATE_LOCK:
+        _publish_state()
+
+
+def _publish_state() -> None:
     local = load_state()
     for _ in range(5):
         fetched = git_run(["git", "fetch", "origin", "main"])
@@ -225,8 +232,13 @@ def send_message(
     chat_id: int,
     text: str,
     reply_markup: dict | None = None,
+    preview: bool = False,
 ) -> int | None:
-    payload: dict = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text[:4000],
+        "disable_web_page_preview": not preview,
+    }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     result = api(token, "sendMessage", payload)
@@ -241,6 +253,7 @@ def edit_message(
     message_id: object,
     text: str,
     reply_markup: dict | None = None,
+    preview: bool = False,
 ) -> None:
     if not isinstance(message_id, int):
         return
@@ -248,7 +261,7 @@ def edit_message(
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text[:4000],
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": not preview,
         "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
     }
     try:
@@ -367,29 +380,36 @@ def filling_bar(percent: float, width: int = 12) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
-def progress_text(percent: float, line: str) -> str:
+def progress_text(percent: float, line: str, url: str = "") -> str:
     shown = int(round(max(0.0, min(100.0, float(percent)))))
-    return f"{line}\n{filling_bar(shown)}  {fa(str(shown))}٪"
+    body = f"{line}\n{filling_bar(shown)}  {fa(str(shown))}٪"
+    if url:
+        body = f"{body}\n{url}"
+    return body
 
 
-def ytdlp_base(url: str, clients: str = "android_vr") -> list[str]:
+def ytdlp_base(url: str, clients: str = "") -> list[str]:
     playlist = ["--playlist-items", "1"] if playlist_only(url) else ["--no-playlist"]
-    return [
+    command = [
         sys.executable,
         "-m",
         "yt_dlp",
         "--no-warnings",
-        "--extractor-args",
-        f"youtube:player_client={clients}",
         "--socket-timeout",
-        "30",
+        "25",
         "--retries",
-        "3",
+        "2",
         "--fragment-retries",
         "5",
         *playlist,
         *cookies_args(),
     ]
+    if clients:
+        command.extend(["--extractor-args", f"youtube:player_client={clients}"])
+    deno = shutil.which("deno")
+    if deno:
+        command.extend(["--js-runtimes", f"deno:{deno}", "--remote-components", "ejs:github"])
+    return command
 
 
 def cookies_args() -> list[str]:
@@ -456,23 +476,28 @@ def probe(url: str) -> dict:
 
 def classify_ytdlp(stderr: str) -> str:
     text = (stderr or "").lower()
-    if "confirm your age" in text or "age-restricted" in text or "age restricted" in text:
+    if (
+        "confirm your age" in text
+        or "age-restricted" in text
+        or "age restricted" in text
+        or "inappropriate for some users" in text
+    ):
         return "age"
     if "not a bot" in text or "sign in to confirm" in text:
         return "bot"
-    if "private" in text:
+    if "private video" in text or "video is private" in text or "this video is private" in text:
         return "private"
-    if "age" in text or "confirm your age" in text:
-        return "age"
-    if "removed" in text or "has been deleted" in text or "video unavailable" in text:
-        return "unavailable"
     if "members-only" in text or "join this channel" in text:
         return "private"
+    if "http error 403" in text or "403: forbidden" in text or "403 forbidden" in text:
+        return "forbidden"
+    if "video unavailable" in text or "has been removed" in text or "has been deleted" in text:
+        return "unavailable"
     return ""
 
 
 def friendly_probe_error(kind: str) -> str:
-    if kind == "bot":
+    if kind in {"bot", "forbidden"}:
         return "یوتیوب این بار اجازه نداد عزیزدلم، یه کم دیگه دوباره امتحان کن"
     if kind == "private":
         return "این ویدیو خصوصی یا محدود است قربونت برم، لینکش را ندارم"
@@ -612,14 +637,14 @@ def offer_video(token: str, state: dict, chat_id: int, url: str) -> None:
         duration_line = f"\nمدت: {format_duration(duration)}"
     text = (
         f"نیایش جانم 💙\n{title}"
-        f"{duration_line}\n\n"
+        f"{duration_line}\n{url}\n\n"
         f"چطور برات بفرستم، عشقم؟{note}"
     )
     if status_id:
-        edit_message(token, chat_id, status_id, text, choice_keyboard(video_id))
+        edit_message(token, chat_id, status_id, text, choice_keyboard(video_id), preview=True)
         message_id = status_id
     else:
-        message_id = send_message(token, chat_id, text, choice_keyboard(video_id))
+        message_id = send_message(token, chat_id, text, choice_keyboard(video_id), preview=True)
     put_job(
         state,
         key,
@@ -665,6 +690,51 @@ def dispatch_download(job: dict, mode: str, quality: str) -> bool:
     return True
 
 
+def _shift_left() -> float:
+    raw = os.environ.get("WATCH_DEADLINE", "").strip()
+    if not raw:
+        return 10**9
+    try:
+        return float(raw) - time.time()
+    except ValueError:
+        return 10**9
+
+
+def _can_download_here() -> bool:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return False
+    if not os.environ.get("YT_PROXY", "").strip():
+        return False
+    return _shift_left() > 25 * 60
+
+
+def _nudge(token: str, chat_id: int, message_id: object, line: str, url: str) -> None:
+    percent = 8
+    for _ in range(6):
+        time.sleep(3)
+        percent = min(32, percent + 4)
+        edit_message(token, chat_id, message_id, progress_text(percent, line, url), preview=bool(url))
+
+
+def _run_local(job: dict, mode: str, quality: str, ack: str) -> None:
+    try:
+        import download
+
+        download.run(
+            chat_id=int(job["chat_id"]),
+            url=str(job["url"]),
+            mode=mode,
+            quality=quality,
+            video_id=str(job["video_id"]),
+            message_id=int(job.get("message_id") or 0),
+            status_line=ack,
+        )
+    except SystemExit:
+        print("local download stopped")
+    except Exception as exc:
+        print(scrub(f"local download {exc.__class__.__name__}: {exc}"))
+
+
 def begin_download(
     token: str,
     state: dict,
@@ -683,9 +753,22 @@ def begin_download(
         )
         return
     message_id = job.get("message_id")
-    edit_message(token, chat_id, message_id, progress_text(0, ack))
+    link = str(job.get("url") or "")
+    edit_message(token, chat_id, message_id, progress_text(6, ack, link), preview=bool(link))
     put_job(state, key, status="queued", mode=mode, quality=quality, message_id=message_id or 0)
+    if _can_download_here():
+        threading.Thread(
+            target=_run_local,
+            args=(state["jobs"][key], mode, quality, ack),
+            daemon=True,
+        ).start()
+        return
     if dispatch_download(state["jobs"][key], mode, quality):
+        threading.Thread(
+            target=_nudge,
+            args=(token, chat_id, message_id, ack, link),
+            daemon=True,
+        ).start()
         return
     put_job(state, key, status="error")
     edit_message(
@@ -883,7 +966,8 @@ def process_updates(token: str, state: dict, poll_timeout: int) -> int:
 
 
 def run_once(token: str, poll_timeout: int = 0, prepare: bool = True) -> int:
-    state = load_state()
+    with STATE_LOCK:
+        state = load_state()
     before = json.dumps(state, ensure_ascii=False, sort_keys=True)
     try:
         if prepare:
@@ -898,9 +982,13 @@ def run_once(token: str, poll_timeout: int = 0, prepare: bool = True) -> int:
             time.sleep(15)
             return 0
         raise
-    after = json.dumps(state, ensure_ascii=False, sort_keys=True)
-    if after != before:
-        save_state(state)
+    with STATE_LOCK:
+        merged = merge_state(state, load_state())
+        after = json.dumps(merged, ensure_ascii=False, sort_keys=True)
+        changed = after != before
+        if changed:
+            save_state(merged)
+    if changed:
         publish_state()
     print(f"done updates={handled}", flush=True)
     return 0
@@ -943,6 +1031,9 @@ def self_check() -> None:
     assert filling_bar(50).count("▰") == 6
     assert classify_ytdlp("Sign in to confirm your age") == "age"
     assert classify_ytdlp("Sign in to confirm you're not a bot") == "bot"
+    webpage = "[youtube] X0AqMgJmbNU: Downloading webpage\nERROR: unable to download video data: HTTP Error 403: Forbidden"
+    assert classify_ytdlp(webpage) == "forbidden"
+    assert progress_text(0, "چشم", "https://youtu.be/X0AqMgJmbNU").endswith("https://youtu.be/X0AqMgJmbNU")
     assert lower_quality("best") == "1080"
     assert lower_quality("360") is None
     print("check ok")
@@ -959,6 +1050,8 @@ def main() -> None:
     if "--watch" in sys.argv:
         limit = int(os.environ.get("WATCH_SECONDS", "0") or "0")
         deadline = time.time() + limit if limit else None
+        if deadline is not None:
+            os.environ["WATCH_DEADLINE"] = str(deadline)
         print("watching", flush=True)
         prepare_bot(token)
         while deadline is None or time.time() < deadline:
