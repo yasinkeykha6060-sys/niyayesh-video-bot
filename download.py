@@ -39,9 +39,9 @@ def video_format(quality: str) -> str:
     # is the whole video and YouTube's tiny pieces are not used.
     if quality == "best":
         return (
-            "b[ext=mp4][protocol=https]/"
             "bv*[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
-            "bv*[ext=mp4]+ba[ext=m4a]/b"
+            "bv*[height>=720][ext=mp4]+ba[ext=m4a]/"
+            "b[ext=mp4][protocol=https]/b"
         )
     height = quality if quality in {"360", "720", "1080"} else "720"
     floor = {"720": "480", "1080": "720"}.get(height)
