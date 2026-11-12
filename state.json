@@ -7,12 +7,14 @@
       "chat_id": 7913503227,
       "duration": 0,
       "message_id": 10,
-      "status": "choosing",
+      "mode": "video",
+      "quality": "360",
+      "status": "queued",
       "title": "سوخو ۲۴؛ شمشیر نیروی هوایی ایران چه توانایی‌هایی دارد؟",
-      "updated": 1794485944.571104,
+      "updated": 1794485949.659118,
       "url": "https://youtu.be/X0AqMgJmbNU?si=fR8m-3n9rG-FVlTb",
       "video_id": "X0AqMgJmbNU"
     }
   },
-  "last_update_id": 227018029
+  "last_update_id": 227018030
 }
