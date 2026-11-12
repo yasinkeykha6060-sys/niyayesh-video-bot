@@ -204,8 +204,6 @@ def _clear_partials(folder: Path) -> None:
 
 
 def _client_order(kind: str, quality: str) -> tuple[str, ...]:
-    if kind == "audio" or quality in {"720", "1080", "best"}:
-        return ("", "tv", "web_embedded,android", "android")
     return ("web_embedded,android", "", "android", "tv")
 
 
