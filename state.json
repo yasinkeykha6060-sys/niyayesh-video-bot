@@ -6,15 +6,15 @@
   "jobs": {
     "1221862634:vYelToHGcpE": {
       "chat_id": 1221862634,
-      "claim": "",
+      "claim": "fa44c893fda844cfbfc74e08305344a0",
       "duration": 0,
       "local_file": "vYelToHGcpE.mp4",
       "message_id": 85,
       "mode": "video",
       "quality": "360",
-      "status": "ready",
+      "status": "sending",
       "title": "حادثه کورش موقع آشپزی و ناگفته‌های حسین از کار با کومان! - دگم نباش 87",
-      "updated": 1794508984.6241405,
+      "updated": 1794509021.1913247,
       "url": "https://youtu.be/vYelToHGcpE?si=urBtA6bGjmPg3P3n",
       "video_id": "vYelToHGcpE"
     },
@@ -71,5 +71,5 @@
       "video_id": "l1dRtuhJUjQ"
     }
   },
-  "last_update_id": 227018083
+  "last_update_id": 227018084
 }
