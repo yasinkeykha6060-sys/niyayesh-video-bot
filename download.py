@@ -35,14 +35,30 @@ def guessed_bytes(duration: int, quality: str) -> int:
 
 
 def video_format(quality: str) -> str:
+    # A single https file first. Split streams are only the backup, so the bar
+    # is the whole video and YouTube's tiny pieces are not used.
     if quality == "best":
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        return (
+            "b[ext=mp4][protocol=https]/"
+            "bv*[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
+            "bv*[ext=mp4]+ba[ext=m4a]/b"
+        )
     height = quality if quality in {"360", "720", "1080"} else "720"
+    floor = {"720": "480", "1080": "720"}.get(height)
+    tall = f"[height>={floor}]" if floor else ""
     return (
-        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/best"
+        f"b[height<={height}]{tall}[ext=mp4][protocol=https]/"
+        f"bv*[height<={height}]{tall}[ext=mp4][protocol=https]+ba[ext=m4a][protocol=https]/"
+        f"b[height<={height}][ext=mp4][protocol=https]/"
+        f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
+        f"b[height<={height}]/b"
     )
+
+
+def audio_format(duration: int = 0) -> str:
+    if duration >= 3 * 60 * 60:
+        return "ba[abr<=48][protocol=https]/ba/b"
+    return "ba[ext=m4a][protocol=https]/ba[ext=m4a]/ba[protocol=https]/ba/b"
 
 
 def step_down(quality: str) -> str | None:
@@ -75,6 +91,7 @@ def newest_media(folder: Path) -> Path | None:
 
 
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+FORMATS_RE = re.compile(r"Downloading\s+(\d+)\s+format")
 
 
 class Bar:
@@ -85,8 +102,9 @@ class Bar:
         self.line = line
         self.url = url
         self.last_at = 0.0
-        self.last_pct = -1.0
-        self.stage = 1
+        self.display = 0.0
+        self.formats = 1
+        self.part = 0
         self._real = False
         self._closed = False
         self._floor = 8.0
@@ -96,14 +114,23 @@ class Bar:
         self._real = True
         self._closed = True
 
-    def _show(self, percent: float, line: str) -> None:
+    def notice(self, line: str) -> None:
+        if self._closed:
+            return
+        found = FORMATS_RE.search(line)
+        if found:
+            self.formats = max(self.formats, int(found.group(1)))
+        if "Destination:" in line and "Frag" not in line:
+            self.part += 1
+
+    def _show(self, percent: float) -> None:
         if self._closed:
             return
         bot.edit_message(
             self.token,
             self.chat_id,
             self.message_id,
-            bot.progress_text(percent, line, self.url),
+            bot.progress_text(percent, self.line, self.url),
             preview=bool(self.url),
         )
 
@@ -116,24 +143,21 @@ class Bar:
             percent = min(36.0, percent + 4)
             self._floor = percent
             try:
-                self._show(percent, self.line)
+                self._show(percent)
             except Exception:
                 print("progress update failed")
 
     def __call__(self, percent: float) -> None:
         self._real = True
-        if percent + 15 < self.last_pct:
-            self.stage += 1
-        shown = 100.0 if percent >= 99 else max(self._floor, percent)
+        part = max(self.part, 1)
+        whole = ((part - 1) + percent / 100.0) / max(self.formats, part) * 100.0
+        shown = min(99.0, max(self.display, whole))
         now = time.time()
-        if shown < 99 and now - self.last_at < 4 and abs(shown - self.last_pct) < 4:
+        if shown < 99 and now - self.last_at < 3 and shown - self.display < 2:
             return
         self.last_at = now
-        self.last_pct = shown
-        line = self.line
-        if self.stage > 1:
-            line = f"نیایش جانم، بخش {bot.fa(str(self.stage))} را هم می‌گیرم 💙"
-        self._show(shown, line)
+        self.display = shown
+        self._show(shown)
 
 
 _reporter: Bar | None = None
@@ -155,6 +179,8 @@ def run_ytdlp(command: list[str]) -> subprocess.CompletedProcess[str]:
         if proc.stdout is None:
             return
         for line in proc.stdout:
+            if _reporter is not None:
+                _reporter.notice(line)
             match = PROGRESS_RE.search(line)
             if match and _reporter is not None:
                 try:
@@ -370,9 +396,6 @@ def download_audio(url: str, folder: Path, duration: int = 0) -> tuple[Path | No
 
 
 def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str, clients: str = "") -> tuple[Path | None, str]:
-    selector = "bestaudio/best"
-    if duration >= 3 * 60 * 60:
-        selector = "bestaudio[abr<=48]/worstaudio/bestaudio"
     command = [
         *base_command(url, folder, proxy, clients),
         "-x",
@@ -381,7 +404,7 @@ def _ytdlp_audio(url: str, folder: Path, duration: int, proxy: str, clients: str
         "--audio-quality",
         "192K" if duration < 3 * 60 * 60 else "48K",
         "-f",
-        selector,
+        audio_format(duration),
         url,
     ]
     completed = run_ytdlp(command)

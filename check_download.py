@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Prove one real media file can be saved for the sample video. Nothing is sent."""
+"""Download the sample at every quality, plus audio. Nothing is sent."""
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import bot
+import download
 
 URL = "https://www.youtube.com/watch?v=X0AqMgJmbNU"
 OUT = Path("/tmp/yt-sample")
-CLIENTS = ("web_embedded,android", "", "android", "tv", "ios")
-
-
-def looks_like_media(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size < 20_000:
-        return False
-    head = path.read_bytes()[:16]
-    if b"ftyp" in head:
-        return True
-    return head[:4] == b"\x1a\x45\xdf\xa3"
+CLIENT = "web_embedded,android"
+HEIGHT_RE = re.compile(r"(\d{2,4})x(\d{2,4})")
 
 
 def activate_proxy(proxy: str) -> None:
@@ -30,136 +24,162 @@ def activate_proxy(proxy: str) -> None:
         return
     os.environ["ALL_PROXY"] = proxy
     os.environ["all_proxy"] = proxy
-    os.environ["HTTPS_PROXY"] = proxy
-    os.environ["https_proxy"] = proxy
 
 
-def grab(clients: str, proxy: str) -> Path | None:
-    if OUT.exists():
-        shutil.rmtree(OUT, ignore_errors=True)
-    OUT.mkdir(parents=True, exist_ok=True)
-    command = [
-        *bot.ytdlp_base(URL, clients),
-        "--newline",
-        "-f",
-        "bv*[height<=360]+ba/b[height<=360]/b",
-        "--merge-output-format",
-        "mp4",
-        "--max-filesize",
-        "80M",
-        "-o",
-        str(OUT / "%(id)s.%(ext)s"),
-    ]
-    if proxy:
-        command.extend(["--proxy", proxy])
-    command.append(URL)
-    completed = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        timeout=240,
-        capture_output=True,
-    )
-    files = [path for path in OUT.rglob("*") if path.is_file() and not path.name.endswith(".part")]
-    good = [path for path in files if looks_like_media(path)]
-    detail = ((completed.stderr or "") + (completed.stdout or ""))[-900:]
-    if good:
-        if completed.returncode != 0:
-            print(detail)
-        return max(good, key=lambda path: path.stat().st_size)
-    print(detail)
-    return None
-
-
-def range_ok(clients: str, proxy: str) -> bool:
-    command = [
-        *bot.ytdlp_base(URL, clients),
-        "-g",
-        "-f",
-        "bv*[height<=360]+ba/b[height<=360]/b",
-    ]
-    if proxy:
-        command.extend(["--proxy", proxy])
-    command.append(URL)
-    completed = subprocess.run(command, check=False, text=True, timeout=90, capture_output=True)
-    urls = [line.strip() for line in (completed.stdout or "").splitlines() if line.startswith("http")]
-    if not urls:
-        print((completed.stderr or completed.stdout or "")[-500:])
+def looks_like_media(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 20_000:
         return False
-    if OUT.exists():
-        shutil.rmtree(OUT, ignore_errors=True)
-    OUT.mkdir(parents=True, exist_ok=True)
-    dest = OUT / "range.bin"
-    fetched = subprocess.run(
+    head = path.read_bytes()[:16]
+    if path.suffix.lower() == ".mp3" and (head[:3] == b"ID3" or head[:2] == b"\xff\xfb"):
+        return True
+    if b"ftyp" in head:
+        return True
+    return head[:4] == b"\x1a\x45\xdf\xa3"
+
+
+def run_yt(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    command = [*bot.ytdlp_base(URL, CLIENT), *args, URL]
+    return subprocess.run(command, check=False, text=True, timeout=timeout, capture_output=True)
+
+
+def available_heights(proxy: str) -> list[int]:
+    command = [*bot.ytdlp_base(URL, CLIENT), "-F", URL]
+    if proxy:
+        command.insert(-1, "--proxy")
+        command.insert(-1, proxy)
+    completed = subprocess.run(command, check=False, text=True, timeout=120, capture_output=True)
+    text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    heights = sorted({int(match.group(2)) for match in HEIGHT_RE.finditer(text) if int(match.group(2)) >= 144})
+    print("heights", heights)
+    interesting = [line for line in text.splitlines() if "x" in line and "mp4" in line.lower()]
+    for line in interesting[:30]:
+        print(line[:180])
+    return heights
+
+
+def download_mode(label: str, proxy: str, audio: bool) -> Path | None:
+    folder = OUT / label
+    if folder.exists():
+        shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    if audio:
+        extra = ["-x", "--audio-format", "mp3", "--audio-quality", "192K", "-f", download.audio_format(0)]
+    else:
+        extra = ["-f", download.video_format(label), "--merge-output-format", "mp4"]
+    command = [
+        *bot.ytdlp_base(URL, CLIENT),
+        "--newline",
+        *extra,
+        "--max-filesize",
+        "400M",
+        "-o",
+        str(folder / "%(id)s.%(ext)s"),
+    ]
+    if proxy:
+        command.extend(["--proxy", proxy])
+    command.append(URL)
+    completed = subprocess.run(command, check=False, text=True, timeout=420, capture_output=True)
+    files = [path for path in folder.rglob("*") if looks_like_media(path)]
+    if not files:
+        detail = ((completed.stderr or "") + (completed.stdout or ""))[-800:]
+        print(detail)
+        return None
+    return max(files, key=lambda path: path.stat().st_size)
+
+
+def probe(path: Path) -> tuple[int, float]:
+    height = subprocess.run(
         [
-            "curl",
-            "-L",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "45",
-            "--proxy",
-            proxy.replace("socks5://", "socks5h://"),
-            "-r",
-            "0-1048575",
-            "-A",
-            "Mozilla/5.0",
-            "-o",
-            str(dest),
-            urls[0],
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=height",
+            "-of",
+            "csv=p=0",
+            str(path),
         ],
         check=False,
         text=True,
         timeout=60,
         capture_output=True,
     )
-    if not dest.exists():
-        print((fetched.stderr or "")[-400:])
+    duration = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        check=False,
+        text=True,
+        timeout=60,
+        capture_output=True,
+    )
+    try:
+        seen = int((height.stdout or "0").strip().splitlines()[0])
+    except (ValueError, IndexError):
+        seen = 0
+    try:
+        seconds = float((duration.stdout or "0").strip())
+    except ValueError:
+        seconds = 0.0
+    return seen, seconds
+
+
+def height_ok(label: str, seen: int, heights: list[int]) -> bool:
+    if label == "audio":
+        return seen == 0
+    if seen < 144:
         return False
-    print(f"range bytes={dest.stat().st_size} head={dest.read_bytes()[:16].hex()} curl={fetched.returncode}")
-    return looks_like_media(dest)
+    if not heights:
+        return True
+    want = 1080 if label == "best" else int(label)
+    choices = [item for item in heights if item <= want + 30]
+    target = max(choices) if choices else want
+    return seen + 40 >= min(want, target)
 
 
 def main() -> int:
-    version = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", "--version"],
-        check=False,
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    print("yt-dlp", (version.stdout or "").strip())
-    print("deno", shutil.which("deno") or "missing")
     proxy = os.environ.get("YT_PROXY", "").strip()
     print("proxy", "yes" if proxy else "no")
-    activate_proxy(proxy)
     if not proxy:
-        print("clean network is required for this test")
+        print("clean network is required")
         return 1
-    for clients in CLIENTS:
-        label = clients or "default"
-        print("try", label, flush=True)
-        try:
-            saved = grab(clients, proxy)
-        except subprocess.TimeoutExpired:
-            print("timeout", label)
-            saved = None
-        if saved is None:
-            try:
-                if range_ok(clients, proxy):
-                    print(f"WINNER {label} range")
-                    shutil.rmtree(OUT, ignore_errors=True)
-                    return 0
-            except subprocess.TimeoutExpired:
-                print("range timeout", label)
-            continue
-        head = saved.read_bytes()[:16].hex()
-        print(f"WINNER {label} bytes={saved.stat().st_size} head={head}")
+    activate_proxy(proxy)
+    if OUT.exists():
         shutil.rmtree(OUT, ignore_errors=True)
-        return 0
-    print("NO_FILE")
-    return 1
+    OUT.mkdir(parents=True, exist_ok=True)
+    heights = available_heights(proxy)
+    failed = False
+    for label in ("360", "720", "1080", "best", "audio"):
+        print("download", label, flush=True)
+        try:
+            saved = download_mode(label, proxy, label == "audio")
+        except subprocess.TimeoutExpired:
+            print("FAIL", label, "timeout")
+            failed = True
+            continue
+        if saved is None:
+            print("FAIL", label, "no file")
+            failed = True
+            continue
+        seen, seconds = probe(saved)
+        ok = height_ok(label, seen, heights) and seconds > 1
+        print(
+            f"{'PASS' if ok else 'FAIL'} {label} bytes={saved.stat().st_size} "
+            f"height={seen} seconds={seconds:.1f}"
+        )
+        if not ok:
+            failed = True
+    shutil.rmtree(OUT, ignore_errors=True)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
