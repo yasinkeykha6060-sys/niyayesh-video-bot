@@ -6,14 +6,15 @@
   "jobs": {
     "1221862634:BYNKY80UcEs": {
       "chat_id": 1221862634,
+      "claim": "da9c3e77a74a427490482b1916f09445",
       "duration": 0,
       "local_file": "BYNKY80UcEs.mp4",
       "message_id": 91,
       "mode": "video",
       "quality": "720",
-      "status": "ready",
+      "status": "sending",
       "title": "زمان های انگلیسی در یک نگاه : 12 زمان گرامر زبان انگلیسی",
-      "updated": 1794566059.076777,
+      "updated": 1794566184.000926,
       "url": "https://youtu.be/BYNKY80UcEs?is=R_OuJSq-q8-UVco6",
       "video_id": "BYNKY80UcEs"
     },
@@ -84,5 +85,5 @@
       "video_id": "l1dRtuhJUjQ"
     }
   },
-  "last_update_id": 227018087
+  "last_update_id": 227018088
 }
